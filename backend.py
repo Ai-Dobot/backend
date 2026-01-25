@@ -57,17 +57,53 @@ def get_access_token():
     """Get OAuth2 access token for FCM V1 API"""
     try:
         if not SERVICE_ACCOUNT_JSON:
+            print("❌ FIREBASE_SERVICE_ACCOUNT environment variable is not set")
             return None
-            
-        service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
+        
+        # Clean and parse JSON - handle cases where env var might have extra whitespace
+        json_str = SERVICE_ACCOUNT_JSON.strip()
+        
+        # Try to extract JSON if there's extra content
+        # Look for the first { and last } to extract valid JSON
+        if not json_str.startswith('{'):
+            start_idx = json_str.find('{')
+            if start_idx != -1:
+                json_str = json_str[start_idx:]
+                print("⚠️ Found JSON starting at position", start_idx)
+        
+        if not json_str.endswith('}'):
+            end_idx = json_str.rfind('}')
+            if end_idx != -1:
+                json_str = json_str[:end_idx + 1]
+                print("⚠️ Found JSON ending at position", end_idx)
+        
+        # Parse the cleaned JSON
+        service_account_info = json.loads(json_str)
+        
+        # Validate required fields
+        required_fields = ['type', 'project_id', 'private_key', 'client_email']
+        for field in required_fields:
+            if field not in service_account_info:
+                print(f"❌ Missing required field in service account: {field}")
+                return None
+        
         credentials = service_account.Credentials.from_service_account_info(
             service_account_info,
             scopes=["https://www.googleapis.com/auth/firebase.messaging"]
         )
         credentials.refresh(Request())
+        print("✅ Firebase access token obtained successfully")
         return credentials.token
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON parsing error: {e}")
+        print(f"   JSON length: {len(SERVICE_ACCOUNT_JSON)}")
+        print(f"   First 100 chars: {SERVICE_ACCOUNT_JSON[:100]}")
+        print(f"   Last 100 chars: {SERVICE_ACCOUNT_JSON[-100:]}")
+        return None
     except Exception as e:
         print(f"❌ Token error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # ==================================================
@@ -190,4 +226,3 @@ if __name__ == "__main__":
     print("=" * 60)
     
     uvicorn.run(app, host="0.0.0.0", port=port)
-
