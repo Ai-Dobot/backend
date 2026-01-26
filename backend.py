@@ -11,6 +11,7 @@ import requests
 import os
 import json
 import uvicorn
+import uuid
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
@@ -135,6 +136,11 @@ def initiate_call(call: PatientCall):
             detail="Firebase not configured"
         )
     
+    # Generate unique video call URL
+    call_id = str(uuid.uuid4())[:8]
+    video_call_url = f"https://meet.jit.si/ai-dobot-call-{call_id}"
+    print(f"🎥 Video call URL: {video_call_url}")
+    
     # Send to all doctors
     success_count = 0
     for token in doctor_tokens:
@@ -145,7 +151,8 @@ def initiate_call(call: PatientCall):
             data={
                 "patient_name": call.patient_name,
                 "patient_id": call.patient_id,
-                "symptom": call.symptom
+                "symptom": call.symptom,
+                "video_call_url": video_call_url
             }
         )
         if result:
@@ -153,7 +160,8 @@ def initiate_call(call: PatientCall):
     
     return {
         "status": "success",
-        "message": f"Notified {success_count}/{len(doctor_tokens)} doctor(s)"
+        "message": f"Notified {success_count}/{len(doctor_tokens)} doctor(s)",
+        "video_call_url": video_call_url
     }
 
 # ==================================================
