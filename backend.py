@@ -65,6 +65,7 @@ class PatientCall(BaseModel):
 # ══════════════════════════════════════════════════════════
 doctors:       Dict[str, dict] = {}
 pending_calls: Dict[str, dict] = {}
+ended_calls:   Dict[str, float] = {}   # call_id -> timestamp ended
 
 
 # ══════════════════════════════════════════════════════════
@@ -125,6 +126,30 @@ def send_fcm(token: str, title: str, body: str, data: dict) -> bool:
                 del doctors[did]
                 print(f"   Removed offline doctor {d['name']}")
     return False
+
+
+# ══════════════════════════════════════════════════════════
+# ENDPOINT: END CALL  (either side posts this to hang up both)
+# ══════════════════════════════════════════════════════════
+@app.post("/api/calls/end/{call_id}")
+def end_call(call_id: str):
+    ended_calls[call_id] = time.time()
+    pending_calls.pop(call_id, None)
+    # Clean old ended calls (keep 5 min)
+    cutoff = time.time() - 300
+    for k in list(ended_calls.keys()):
+        if ended_calls[k] < cutoff:
+            del ended_calls[k]
+    print(f"📵 Call ended: {call_id}")
+    return {"status": "ended"}
+
+
+# ══════════════════════════════════════════════════════════
+# ENDPOINT: CHECK IF CALL ENDED  (polled by patient side)
+# ══════════════════════════════════════════════════════════
+@app.get("/api/calls/ended/{call_id}")
+def is_call_ended(call_id: str):
+    return {"ended": call_id in ended_calls}
 
 
 # ══════════════════════════════════════════════════════════
