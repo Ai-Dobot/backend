@@ -31,8 +31,8 @@ PROJECT_ID           = os.getenv("FIREBASE_PROJECT_ID", "ai-dobot")
 app = FastAPI(title="AI Dobot — Telemedicine Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],        # wildcard works only when credentials=False
+    allow_credentials=False,    # we use FCM tokens not cookies — no credentials needed
     allow_methods=["*"],
     allow_headers=["*"],
 )
