@@ -60,9 +60,11 @@ class PatientCall(BaseModel):
 
 # ══════════════════════════════════════════════════════════
 # IN-MEMORY STORAGE
-# doctors: { doctor_id: { name, specialty, avatar, token, signed_in_at, last_seen } }
+# doctors:       { doctor_id: {...} }
+# pending_calls: { call_id:   { doctor_id, patient_name, ... } }
 # ══════════════════════════════════════════════════════════
-doctors: Dict[str, dict] = {}
+doctors:       Dict[str, dict] = {}
+pending_calls: Dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════
@@ -123,6 +125,27 @@ def send_fcm(token: str, title: str, body: str, data: dict) -> bool:
                 del doctors[did]
                 print(f"   Removed offline doctor {d['name']}")
     return False
+
+
+# ══════════════════════════════════════════════════════════
+# ENDPOINT: POLL PENDING CALLS  (doctor polls every 5s)
+# Catches calls that FCM missed due to background tab
+# ══════════════════════════════════════════════════════════
+@app.get("/api/calls/pending/{doctor_id}")
+def get_pending_calls(doctor_id: str):
+    cutoff = time.time() - 120
+    my_calls = [
+        {**v, "call_id": k}
+        for k, v in pending_calls.items()
+        if v.get("doctor_id") == doctor_id and v.get("created_at", 0) > cutoff
+    ]
+    return {"calls": my_calls}
+
+
+@app.delete("/api/calls/pending/{call_id}")
+def acknowledge_call(call_id: str):
+    pending_calls.pop(call_id, None)
+    return {"status": "ok"}
 
 
 # ══════════════════════════════════════════════════════════
@@ -230,6 +253,19 @@ def initiate_call(call: PatientCall):
             }
         )
         if ok: success += 1
+
+    # Store pending so polling catches what FCM misses
+    for d in targets:
+        target_id = next((did for did, doc in doctors.items() if doc is d), None)
+        if target_id:
+            pending_calls[call_id + "_" + target_id] = {
+                "doctor_id":      target_id,
+                "patient_name":   call.patient_name,
+                "patient_id":     call.patient_id,
+                "symptom":        call.symptom,
+                "video_call_url": video_call_url,
+                "created_at":     time.time(),
+            }
 
     print(f"   Notified {success}/{len(targets)} doctor(s)  room={video_call_url}\n")
     return {"status": "success", "message": f"Notified {success} doctor(s)",
