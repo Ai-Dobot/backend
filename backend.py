@@ -380,7 +380,7 @@ def get_online_doctors(
         online = [
             d for d in online
             if _personal_name_match(dn, d.get("name") or "")
-            and dp in _norm_phone(d.get("phone") or "")
+            and _norm_phone(d.get("phone") or "").endswith(dp)
         ]
     else:
         if dn:
