@@ -55,6 +55,7 @@ app.add_middleware(
 # ══════════════════════════════════════════════════════════
 doctors:       Dict[str, dict] = {}
 pending_calls: Dict[str, dict] = {}
+pending_hospital_calls: Dict[str, dict] = {}
 ended_calls:   Dict[str, float] = {}
 
 
@@ -248,6 +249,12 @@ def health():
 class DoctorSignIn(BaseModel):
     name: str; specialty: str; avatar: str; token: str
     doctor_id: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    phone: Optional[str] = None
+    hospital_name: Optional[str] = None
+    hospital_registration_no: Optional[str] = None
+    is_private: Optional[bool] = True
 
 class DoctorSignOut(BaseModel):
     doctor_id: str
@@ -258,6 +265,12 @@ def doctor_signin(data: DoctorSignIn):
     doctors[doctor_id] = {
         "name": data.name.strip(), "specialty": data.specialty.strip(),
         "avatar": data.avatar, "token": data.token.strip(),
+        "country": (data.country or "").strip(),
+        "city": (data.city or "").strip(),
+        "phone": (data.phone or "").strip(),
+        "hospital_name": (data.hospital_name or "").strip(),
+        "hospital_registration_no": (data.hospital_registration_no or "").strip(),
+        "is_private": bool(data.is_private if data.is_private is not None else True),
         "signed_in_at": time.time(), "last_seen": time.time(),
     }
     print(f"Doctor signed in: {data.name} id={doctor_id}")
@@ -281,8 +294,38 @@ def register_token(data: dict):
     return {"status": "success", "message": "Use /api/doctor/signin instead"}
 
 @app.get("/api/doctors/online")
-def get_online_doctors():
+def get_online_doctors(
+    country: Optional[str] = None,
+    city: Optional[str] = None,
+    doctor_name: Optional[str] = None,
+    doctor_phone: Optional[str] = None,
+    hospital_name: Optional[str] = None,
+    hospital_reg_no: Optional[str] = None,
+    only_private: Optional[bool] = None
+):
     online = _online_doctors()
+    c = (country or "").strip().lower()
+    ci = (city or "").strip().lower()
+    dn = (doctor_name or "").strip().lower()
+    dp = (doctor_phone or "").strip().lower()
+    hn = (hospital_name or "").strip().lower()
+    hr = (hospital_reg_no or "").strip().lower()
+
+    if c:
+        online = [d for d in online if (d.get("country") or "").strip().lower() == c]
+    if ci:
+        online = [d for d in online if (d.get("city") or "").strip().lower() == ci]
+    if dn:
+        online = [d for d in online if dn in (d.get("name") or "").strip().lower()]
+    if dp:
+        online = [d for d in online if (d.get("phone") or "").strip().lower() == dp]
+    if hn:
+        online = [d for d in online if hn in (d.get("hospital_name") or "").strip().lower()]
+    if hr:
+        online = [d for d in online if (d.get("hospital_registration_no") or "").strip().lower() == hr]
+    if only_private is True:
+        online = [d for d in online if bool(d.get("is_private", True))]
+
     safe = [{k: v for k, v in d.items() if k != "token"} for d in online]
     return {"status": "success", "doctors": safe, "count": len(safe)}
 
@@ -293,9 +336,42 @@ def get_online_doctors():
 class PatientCall(BaseModel):
     patient_name: str; patient_id: str; symptom: str
     doctor_id: Optional[str] = None
+    hospital_name: Optional[str] = None
+    hospital_reg_no: Optional[str] = None
 
 @app.post("/api/calls/initiate")
 def initiate_call(call: PatientCall):
+    hosp_name = (call.hospital_name or "").strip()
+    hosp_reg = (call.hospital_reg_no or "").strip()
+    if hosp_name and hosp_reg:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""SELECT id, name, registration_no
+                       FROM hospitals
+                       WHERE LOWER(name)=LOWER(%s) AND LOWER(COALESCE(registration_no,''))=LOWER(%s)
+                       LIMIT 1""", (hosp_name, hosp_reg))
+        h = cur.fetchone()
+        cur.close(); conn.close()
+        if not h:
+            raise HTTPException(404, "Selected hospital not found")
+        call_id = str(uuid.uuid4())[:8]
+        video_call_url = f"https://meet.jit.si/ai-dobot-{call_id}"
+        pending_hospital_calls[call_id + "_H" + str(h["id"])] = {
+            "call_id": call_id,
+            "hospital_id": h["id"],
+            "hospital_name": h["name"],
+            "patient_name": call.patient_name,
+            "patient_id": call.patient_id,
+            "symptom": call.symptom,
+            "video_call_url": video_call_url,
+            "created_at": time.time(),
+        }
+        return {
+            "status": "success",
+            "message": f"Hospital {h['name']} notified",
+            "video_call_url": video_call_url,
+            "call_id": call_id
+        }
+
     online = _online_doctors()
     if not online:
         raise HTTPException(503, "No doctors online right now.")
@@ -350,10 +426,36 @@ def is_call_ended(call_id: str):
 def end_call(call_id: str):
     ended_calls[call_id] = time.time()
     pending_calls.pop(call_id, None)
+    for k in list(pending_hospital_calls.keys()):
+        if pending_hospital_calls[k].get("call_id") == call_id:
+            pending_hospital_calls.pop(k, None)
     cutoff = time.time() - 300
     for k in list(ended_calls.keys()):
         if ended_calls[k] < cutoff: del ended_calls[k]
     return {"status": "ended"}
+
+@app.get("/api/hospitals/calls/pending")
+def hospital_pending_calls(authorization: Optional[str] = Header(default=None)):
+    sess = _verify("hospital_sessions", _bearer(authorization))
+    if not sess:
+        raise HTTPException(401, "Unauthorized")
+    hid = sess["hospital_id"]
+    cutoff = time.time() - 300
+    calls = [{**v, "id": k} for k, v in pending_hospital_calls.items()
+             if v.get("hospital_id") == hid and v.get("created_at", 0) > cutoff]
+    calls.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return {"calls": calls}
+
+@app.delete("/api/hospitals/calls/pending/{pending_id}")
+def hospital_ack_call(pending_id: str, authorization: Optional[str] = Header(default=None)):
+    sess = _verify("hospital_sessions", _bearer(authorization))
+    if not sess:
+        raise HTTPException(401, "Unauthorized")
+    call = pending_hospital_calls.get(pending_id)
+    if call and call.get("hospital_id") == sess["hospital_id"]:
+        pending_hospital_calls.pop(pending_id, None)
+        return {"status": "ok"}
+    raise HTTPException(404, "Call not found")
 
 
 # ══════════════════════════════════════════════════════════
@@ -457,14 +559,16 @@ def reg_doctor_login(d: LoginReq):
     if not ident:
         raise HTTPException(400,"Identifier is required")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""SELECT * FROM reg_doctors
-                   WHERE password_hash=%s
-                     AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+    cur.execute("""SELECT rd.*, h.name AS hospital_name, h.registration_no AS hospital_registration_no
+                   FROM reg_doctors rd
+                   LEFT JOIN hospitals h ON rd.hospital_id = h.id
+                   WHERE rd.password_hash=%s
+                     AND (LOWER(rd.email)=LOWER(%s) OR LOWER(COALESCE(rd.username,''))=LOWER(%s) OR rd.phone=%s)
                    ORDER BY CASE
-                     WHEN approval_status='approved' THEN 0
-                     WHEN approval_status='pending'  THEN 1
+                     WHEN rd.approval_status='approved' THEN 0
+                     WHEN rd.approval_status='pending'  THEN 1
                      ELSE 2
-                   END, created_at DESC
+                   END, rd.created_at DESC
                    LIMIT 1""",(_hash(d.password),ident,ident,ident))
     doc = cur.fetchone(); cur.close(); conn.close()
     if not doc: raise HTTPException(401,"Invalid credentials")
