@@ -460,6 +460,11 @@ def reg_doctor_login(d: LoginReq):
     cur.execute("""SELECT * FROM reg_doctors
                    WHERE password_hash=%s
                      AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+                   ORDER BY CASE
+                     WHEN approval_status='approved' THEN 0
+                     WHEN approval_status='pending'  THEN 1
+                     ELSE 2
+                   END, created_at DESC
                    LIMIT 1""",(_hash(d.password),ident,ident,ident))
     doc = cur.fetchone(); cur.close(); conn.close()
     if not doc: raise HTTPException(401,"Invalid credentials")
@@ -530,6 +535,11 @@ def hosp_login(d: LoginReq):
     cur.execute("""SELECT * FROM hospitals
                    WHERE password_hash=%s
                      AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+                   ORDER BY CASE
+                     WHEN approval_status='approved' THEN 0
+                     WHEN approval_status='pending'  THEN 1
+                     ELSE 2
+                   END, created_at DESC
                    LIMIT 1""",(_hash(d.password),ident,ident,ident))
     h = cur.fetchone(); cur.close(); conn.close()
     if not h: raise HTTPException(401,"Invalid credentials")
@@ -654,7 +664,11 @@ def patient_login(d: PatientLogin):
                           OR LOWER(COALESCE(username,''))=LOWER(%s)
                           OR phone=%s
                           OR system_id=%s)
-                   ORDER BY created_at DESC LIMIT 1""",
+                   ORDER BY CASE
+                     WHEN approval_status='approved' THEN 0
+                     WHEN approval_status='pending'  THEN 1
+                     ELSE 2
+                   END, created_at DESC LIMIT 1""",
                 (_hash(d.password),ident,ident,ident,ident.upper()))
     u = cur.fetchone(); cur.close(); conn.close()
     if not u: raise HTTPException(401,"Invalid identifier or password")
@@ -751,6 +765,11 @@ def pharm_login(d: LoginReq):
     cur.execute("""SELECT * FROM pharmacies
                    WHERE password_hash=%s
                      AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+                   ORDER BY CASE
+                     WHEN approval_status='approved' THEN 0
+                     WHEN approval_status='pending'  THEN 1
+                     ELSE 2
+                   END, created_at DESC
                    LIMIT 1""",(_hash(d.password),ident,ident,ident))
     p = cur.fetchone(); cur.close(); conn.close()
     if not p: raise HTTPException(401,"Invalid credentials")
