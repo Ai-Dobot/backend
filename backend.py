@@ -15,7 +15,7 @@ HOW IT CONNECTS:
   Hospital/Patient/Pharmacy portals ► /api/hospitals /api/patients /api/pharmacies
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
@@ -149,6 +149,12 @@ def init_db():
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {t} (
                 id SERIAL PRIMARY KEY, {col} INTEGER NOT NULL,
                 token TEXT UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL)""")
+        cur.execute("ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS username TEXT UNIQUE")
+        cur.execute("ALTER TABLE reg_doctors ADD COLUMN IF NOT EXISTS username TEXT UNIQUE")
+        cur.execute("ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS username TEXT UNIQUE")
+        cur.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS username TEXT")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_username_unique
+                       ON patients (LOWER(username)) WHERE username IS NOT NULL""")
         conn.commit(); cur.close(); conn.close()
         print("DB init OK")
     except Exception as e:
@@ -339,7 +345,7 @@ def admin_login(data: dict):
     raise HTTPException(401, "Wrong password")
 
 @app.get("/api/admin/pending")
-def admin_pending(authorization: str = None):
+def admin_pending(authorization: Optional[str] = Header(default=None)):
     if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT id,system_id,name,email,country,city,phone,qualifications,license_doc_url,approval_status,created_at FROM reg_doctors ORDER BY approval_status='pending' DESC, created_at DESC")
@@ -354,7 +360,7 @@ def admin_pending(authorization: str = None):
     return {"doctors": docs, "pharmacies": pharms, "hospitals": hosps, "patients": pats}
 
 @app.post("/api/admin/approve")
-def admin_approve(data: dict, authorization: str = None):
+def admin_approve(data: dict, authorization: Optional[str] = Header(default=None)):
     if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
     entity_type = data.get("type")    # "doctor", "pharmacy", "hospital"
     entity_id   = data.get("id")
@@ -370,7 +376,7 @@ def admin_approve(data: dict, authorization: str = None):
     return {"success": True, "message": f"{row['name']} ({row['email']}) {action}"}
 
 @app.get("/api/admin/stats")
-def admin_stats(authorization: str = None):
+def admin_stats(authorization: Optional[str] = Header(default=None)):
     if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT approval_status, COUNT(*) FROM reg_doctors GROUP BY approval_status")
@@ -393,10 +399,11 @@ def admin_stats(authorization: str = None):
 # NEW: HOSPITAL REGISTRATION (Neon DB)
 # ══════════════════════════════════════════════════════════
 class LoginReq(BaseModel):
-    email: str; password: str
+    identifier: str; password: str
 
 class RegDoctorCreate(BaseModel):
     name:str; email:str; password:str; specialty:Optional[str]=None
+    username:Optional[str]=None
     country:Optional[str]=None; city:Optional[str]=None; phone:Optional[str]=None
     qualifications:Optional[str]=None; bio:Optional[str]=None
     avatar:Optional[str]="👨‍⚕️"; consultation_fee:Optional[float]=0
@@ -407,9 +414,9 @@ def reg_doctor_register(d: RegDoctorCreate):
     sid = _gen_id("DOC"); conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("""INSERT INTO reg_doctors
-            (system_id,name,email,password_hash,specialty,country,city,phone,qualifications,bio,avatar,consultation_fee,license_doc_url)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
-            (sid,d.name,d.email,_hash(d.password),d.specialty,d.country,d.city,d.phone,
+            (system_id,name,email,username,password_hash,specialty,country,city,phone,qualifications,bio,avatar,consultation_fee,license_doc_url)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
+            (sid,d.name,d.email,(d.username or "").strip() or None,_hash(d.password),d.specialty,d.country,d.city,d.phone,
              d.qualifications,d.bio,d.avatar,d.consultation_fee,d.license_doc_url))
         row = cur.fetchone(); conn.commit()
         return {"success":True,"system_id":row["system_id"],
@@ -420,8 +427,14 @@ def reg_doctor_register(d: RegDoctorCreate):
 
 @app.post("/api/reg_doctors/login")
 def reg_doctor_login(d: LoginReq):
+    ident = (d.identifier or "").strip()
+    if not ident:
+        raise HTTPException(400,"Identifier is required")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM reg_doctors WHERE email=%s AND password_hash=%s",(d.email,_hash(d.password)))
+    cur.execute("""SELECT * FROM reg_doctors
+                   WHERE password_hash=%s
+                     AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+                   LIMIT 1""",(_hash(d.password),ident,ident,ident))
     doc = cur.fetchone(); cur.close(); conn.close()
     if not doc: raise HTTPException(401,"Invalid credentials")
     if doc.get("approval_status","pending") == "pending":
@@ -452,7 +465,7 @@ def reg_doctor_login_sysid(data: dict):
     return {"success":True,"token":tok,"doctor":r,"specialty":doc.get("specialty","")}
 
 @app.get("/api/reg_doctors/me")
-def reg_doctor_me(authorization: str = None):
+def reg_doctor_me(authorization: Optional[str] = Header(default=None)):
     sess = _verify("reg_doctor_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -463,6 +476,7 @@ def reg_doctor_me(authorization: str = None):
 
 class HospReg(BaseModel):
     name:str; email:str; password:str
+    username:Optional[str]=None
     country:Optional[str]=None; city:Optional[str]=None
     address:Optional[str]=None; phone:Optional[str]=None; registration_no:Optional[str]=None
 
@@ -470,9 +484,9 @@ class HospReg(BaseModel):
 def hosp_register(d: HospReg):
     sid = _gen_id("HSP"); conn = get_conn(); cur = conn.cursor()
     try:
-        cur.execute("""INSERT INTO hospitals (system_id,name,email,password_hash,country,city,address,phone,registration_no)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
-            (sid,d.name,d.email,_hash(d.password),d.country,d.city,d.address,d.phone,d.registration_no))
+        cur.execute("""INSERT INTO hospitals (system_id,name,email,username,password_hash,country,city,address,phone,registration_no)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
+            (sid,d.name,d.email,(d.username or "").strip() or None,_hash(d.password),d.country,d.city,d.address,d.phone,d.registration_no))
         row = cur.fetchone(); conn.commit()
         tok = _session("hospital_sessions","hospital_id",row["id"])
         return {"success":True,"system_id":row["system_id"],"token":tok,
@@ -483,8 +497,14 @@ def hosp_register(d: HospReg):
 
 @app.post("/api/hospitals/login")
 def hosp_login(d: LoginReq):
+    ident = (d.identifier or "").strip()
+    if not ident:
+        raise HTTPException(400,"Identifier is required")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM hospitals WHERE email=%s AND password_hash=%s",(d.email,_hash(d.password)))
+    cur.execute("""SELECT * FROM hospitals
+                   WHERE password_hash=%s
+                     AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+                   LIMIT 1""",(_hash(d.password),ident,ident,ident))
     h = cur.fetchone(); cur.close(); conn.close()
     if not h: raise HTTPException(401,"Invalid credentials")
     if h.get("approval_status","approved") == "pending":
@@ -515,8 +535,7 @@ def hosp_login_sysid(data: dict):
     return {"success":True,"token":tok,"hospital":r}
 
 @app.get("/api/hospitals/me")
-def hosp_me(authorization: str = None):
-    from fastapi import Header
+def hosp_me(authorization: Optional[str] = Header(default=None)):
     sess = _verify("hospital_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -525,7 +544,7 @@ def hosp_me(authorization: str = None):
     return dict(h) if h else {}
 
 @app.get("/api/hospitals/doctors")
-def hosp_doctors(authorization: str = None):
+def hosp_doctors(authorization: Optional[str] = Header(default=None)):
     sess = _verify("hospital_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -534,7 +553,7 @@ def hosp_doctors(authorization: str = None):
     return {"doctors":rows}
 
 @app.post("/api/hospitals/add-doctor")
-def hosp_add_doctor(data: dict, authorization: str = None):
+def hosp_add_doctor(data: dict, authorization: Optional[str] = Header(default=None)):
     sess = _verify("hospital_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -545,7 +564,7 @@ def hosp_add_doctor(data: dict, authorization: str = None):
     return {"success":True,"message":f"Dr. {doc['name']} added to hospital"}
 
 @app.post("/api/hospitals/remove-doctor")
-def hosp_remove_doctor(data: dict, authorization: str = None):
+def hosp_remove_doctor(data: dict, authorization: Optional[str] = Header(default=None)):
     sess = _verify("hospital_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -562,10 +581,11 @@ def hosp_remove_doctor(data: dict, authorization: str = None):
 class PatientSetup(BaseModel):
     system_id:str; password:str
     name:Optional[str]=None; email:Optional[str]=None
+    username:Optional[str]=None
     phone:Optional[str]=None; country:Optional[str]=None; date_of_birth:Optional[str]=None
 
 class PatientLogin(BaseModel):
-    system_id:str; password:str
+    identifier:str; password:str
 
 @app.post("/api/patients/create-from-robot")
 def patient_create(data: dict):
@@ -589,8 +609,8 @@ def patient_setup(d: PatientSetup):
             from datetime import datetime
             dob = datetime.strptime(d.date_of_birth,"%Y-%m-%d").date()
         except: pass
-    cur.execute("UPDATE patients SET password_hash=%s,name=%s,email=%s,phone=%s,country=%s,date_of_birth=%s WHERE id=%s",
-                (_hash(d.password),d.name,d.email,d.phone,d.country,dob,u["id"]))
+    cur.execute("UPDATE patients SET password_hash=%s,name=%s,email=%s,username=%s,phone=%s,country=%s,date_of_birth=%s WHERE id=%s",
+                (_hash(d.password),d.name,d.email,(d.username or "").strip() or None,d.phone,d.country,dob,u["id"]))
     conn.commit()
     tok = _session("patient_sessions","patient_id",u["id"])
     cur.close(); conn.close()
@@ -598,10 +618,24 @@ def patient_setup(d: PatientSetup):
 
 @app.post("/api/patients/login")
 def patient_login(d: PatientLogin):
+    ident = (d.identifier or "").strip()
+    if not ident:
+        raise HTTPException(400,"Identifier is required")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM patients WHERE system_id=%s AND password_hash=%s",(d.system_id,_hash(d.password)))
+    cur.execute("""SELECT * FROM patients
+                   WHERE password_hash=%s
+                     AND (LOWER(COALESCE(email,''))=LOWER(%s)
+                          OR LOWER(COALESCE(username,''))=LOWER(%s)
+                          OR phone=%s
+                          OR system_id=%s)
+                   ORDER BY created_at DESC LIMIT 1""",
+                (_hash(d.password),ident,ident,ident,ident.upper()))
     u = cur.fetchone(); cur.close(); conn.close()
-    if not u: raise HTTPException(401,"Invalid system ID or password")
+    if not u: raise HTTPException(401,"Invalid identifier or password")
+    if u.get("approval_status","approved") == "pending":
+        raise HTTPException(403,"Your registration is pending admin approval.")
+    if u.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your registration was not approved.")
     tok = _session("patient_sessions","patient_id",u["id"])
     r = dict(u); r.pop("password_hash",None)
     return {"success":True,"token":tok,"patient":r}
@@ -628,7 +662,7 @@ def patient_login_sysid(data: dict):
     return {"success":True,"token":tok,"patient":r}
 
 @app.get("/api/patients/me")
-def patient_me(authorization: str = None):
+def patient_me(authorization: Optional[str] = Header(default=None)):
     sess = _verify("patient_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -637,7 +671,7 @@ def patient_me(authorization: str = None):
     return dict(u) if u else {}
 
 @app.get("/api/patients/records")
-def patient_records(authorization: str = None):
+def patient_records(authorization: Optional[str] = Header(default=None)):
     sess = _verify("patient_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -646,7 +680,7 @@ def patient_records(authorization: str = None):
     return {"records":rows}
 
 @app.post("/api/patients/set-personal-doctor")
-def set_personal_doctor(data: dict, authorization: str = None):
+def set_personal_doctor(data: dict, authorization: Optional[str] = Header(default=None)):
     sess = _verify("patient_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -663,6 +697,7 @@ def set_personal_doctor(data: dict, authorization: str = None):
 # ══════════════════════════════════════════════════════════
 class PharmReg(BaseModel):
     name:str; email:str; password:str
+    username:Optional[str]=None
     country:Optional[str]=None; city:Optional[str]=None
     address:Optional[str]=None; phone:Optional[str]=None; license_no:Optional[str]=None
     license_doc_url:Optional[str]=None
@@ -671,9 +706,9 @@ class PharmReg(BaseModel):
 def pharm_register(d: PharmReg):
     sid = _gen_id("PHM"); conn = get_conn(); cur = conn.cursor()
     try:
-        cur.execute("""INSERT INTO pharmacies (system_id,name,email,password_hash,country,city,address,phone,license_no,license_doc_url)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
-            (sid,d.name,d.email,_hash(d.password),d.country,d.city,d.address,d.phone,d.license_no,getattr(d,'license_doc_url',None)))
+        cur.execute("""INSERT INTO pharmacies (system_id,name,email,username,password_hash,country,city,address,phone,license_no,license_doc_url)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
+            (sid,d.name,d.email,(d.username or "").strip() or None,_hash(d.password),d.country,d.city,d.address,d.phone,d.license_no,getattr(d,'license_doc_url',None)))
         row = cur.fetchone(); conn.commit()
         tok = _session("pharmacy_sessions","pharmacy_id",row["id"])
         return {"success":True,"system_id":row["system_id"],"token":tok}
@@ -683,8 +718,14 @@ def pharm_register(d: PharmReg):
 
 @app.post("/api/pharmacies/login")
 def pharm_login(d: LoginReq):
+    ident = (d.identifier or "").strip()
+    if not ident:
+        raise HTTPException(400,"Identifier is required")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM pharmacies WHERE email=%s AND password_hash=%s",(d.email,_hash(d.password)))
+    cur.execute("""SELECT * FROM pharmacies
+                   WHERE password_hash=%s
+                     AND (LOWER(email)=LOWER(%s) OR LOWER(COALESCE(username,''))=LOWER(%s) OR phone=%s)
+                   LIMIT 1""",(_hash(d.password),ident,ident,ident))
     p = cur.fetchone(); cur.close(); conn.close()
     if not p: raise HTTPException(401,"Invalid credentials")
     if p.get("approval_status","pending") == "pending":
@@ -715,7 +756,7 @@ def pharm_login_sysid(data: dict):
     return {"success":True,"token":tok,"pharmacy":r}
 
 @app.get("/api/pharmacies/me")
-def pharm_me(authorization: str = None):
+def pharm_me(authorization: Optional[str] = Header(default=None)):
     sess = _verify("pharmacy_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -729,7 +770,7 @@ class MedCreate(BaseModel):
     price:float; stock:int=0; requires_prescription:bool=False
 
 @app.post("/api/pharmacies/medicines")
-def add_medicine(d: MedCreate, authorization: str = None):
+def add_medicine(d: MedCreate, authorization: Optional[str] = Header(default=None)):
     sess = _verify("pharmacy_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -740,7 +781,7 @@ def add_medicine(d: MedCreate, authorization: str = None):
     return {"success":True,"medicine_id":row["id"]}
 
 @app.get("/api/pharmacies/medicines")
-def my_medicines(authorization: str = None):
+def my_medicines(authorization: Optional[str] = Header(default=None)):
     sess = _verify("pharmacy_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -749,7 +790,7 @@ def my_medicines(authorization: str = None):
     return {"medicines":rows}
 
 @app.delete("/api/pharmacies/medicines/{med_id}")
-def delete_medicine(med_id: int, authorization: str = None):
+def delete_medicine(med_id: int, authorization: Optional[str] = Header(default=None)):
     sess = _verify("pharmacy_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
@@ -771,7 +812,7 @@ def shop_medicines(country: str = None, category: str = None, search: str = None
     return {"medicines":rows,"page":page}
 
 @app.post("/api/shop/order")
-def place_order(data: dict, authorization: str = None):
+def place_order(data: dict, authorization: Optional[str] = Header(default=None)):
     sess = _verify("patient_sessions",_bearer(authorization))
     patient_id = sess["patient_id"] if sess else None
     items = data.get("items",[])
