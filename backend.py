@@ -75,6 +75,40 @@ def _norm_name(v: str) -> str:
 def _norm_phone(v: str) -> str:
     return re.sub(r"\D+", "", (v or ""))
 
+def _hydrate_online_doctor(doc: dict) -> dict:
+    # If live in-memory presence lacks profile metadata, enrich from DB by name.
+    if (doc.get("country") and doc.get("phone")) or not doc.get("name"):
+        return doc
+    try:
+        conn = get_conn(); cur = conn.cursor()
+        cur.execute("""
+            SELECT rd.country, rd.city, rd.phone, rd.hospital_id,
+                   h.name AS hospital_name, h.registration_no AS hospital_registration_no
+            FROM reg_doctors rd
+            LEFT JOIN hospitals h ON rd.hospital_id = h.id
+            WHERE LOWER(rd.name)=LOWER(%s)
+            ORDER BY CASE
+              WHEN rd.approval_status='approved' THEN 0
+              WHEN rd.approval_status='pending' THEN 1
+              ELSE 2
+            END, rd.created_at DESC
+            LIMIT 1
+        """, (doc.get("name",""),))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if not row:
+            return doc
+        d = dict(doc)
+        if not d.get("country"): d["country"] = row.get("country") or ""
+        if not d.get("city"): d["city"] = row.get("city") or ""
+        if not d.get("phone"): d["phone"] = row.get("phone") or ""
+        if not d.get("hospital_name"): d["hospital_name"] = row.get("hospital_name") or ""
+        if not d.get("hospital_registration_no"): d["hospital_registration_no"] = row.get("hospital_registration_no") or ""
+        d["is_private"] = row.get("hospital_id") is None
+        return d
+    except Exception:
+        return doc
+
 
 # ══════════════════════════════════════════════════════════
 # NEON DB (new registration system)
@@ -311,7 +345,7 @@ def get_online_doctors(
     hospital_reg_no: Optional[str] = None,
     only_private: Optional[bool] = None
 ):
-    online = _online_doctors()
+    online = [_hydrate_online_doctor(d) for d in _online_doctors()]
     c = (country or "").strip().lower()
     ci = (city or "").strip().lower()
     dn = _norm_name(doctor_name or "")
@@ -382,7 +416,7 @@ def initiate_call(call: PatientCall):
             "call_id": call_id
         }
 
-    online = _online_doctors()
+    online = [_hydrate_online_doctor(d) for d in _online_doctors()]
     if not online:
         raise HTTPException(503, "No doctors online right now.")
     if not SERVICE_ACCOUNT_JSON:
