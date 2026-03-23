@@ -77,6 +77,13 @@ def _hash(pw): return hashlib.sha256(pw.encode()).hexdigest()
 def _gen_id(prefix): return prefix + '-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 def _tok(): return secrets.token_urlsafe(32)
 def _bearer(h): return (h or "").replace("Bearer ", "")
+def _unique_msg(err):
+    msg = (str(err) or "").lower()
+    if "username" in msg:
+        return "Username already taken"
+    if "system_id" in msg:
+        return "Account code conflict, please retry"
+    return "Duplicate value found for a unique field"
 
 def _session(table, id_col, eid):
     tok = _tok()
@@ -155,6 +162,25 @@ def init_db():
         cur.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS username TEXT")
         cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_username_unique
                        ON patients (LOWER(username)) WHERE username IS NOT NULL""")
+        cur.execute("""
+            DO $$
+            DECLARE c RECORD;
+            BEGIN
+                FOR c IN
+                    SELECT tc.table_name, tc.constraint_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.constraint_column_usage ccu
+                      ON tc.constraint_name = ccu.constraint_name
+                     AND tc.table_schema = ccu.table_schema
+                    WHERE tc.table_schema = 'public'
+                      AND tc.constraint_type = 'UNIQUE'
+                      AND ccu.column_name = 'email'
+                      AND tc.table_name IN ('hospitals','reg_doctors','pharmacies')
+                LOOP
+                    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', c.table_name, c.constraint_name);
+                END LOOP;
+            END $$;
+        """)
         conn.commit(); cur.close(); conn.close()
         print("DB init OK")
     except Exception as e:
@@ -421,8 +447,8 @@ def reg_doctor_register(d: RegDoctorCreate):
         row = cur.fetchone(); conn.commit()
         return {"success":True,"system_id":row["system_id"],
                 "message":"Registration submitted. Please wait for admin approval before signing in."}
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback(); raise HTTPException(400,"Email already registered")
+    except psycopg2.errors.UniqueViolation as e:
+        conn.rollback(); raise HTTPException(400, _unique_msg(e))
     finally: cur.close(); conn.close()
 
 @app.post("/api/reg_doctors/login")
@@ -491,8 +517,8 @@ def hosp_register(d: HospReg):
         tok = _session("hospital_sessions","hospital_id",row["id"])
         return {"success":True,"system_id":row["system_id"],"token":tok,
                 "message":"Registration submitted. Please wait for admin approval before signing in."}
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback(); raise HTTPException(400,"Email already registered")
+    except psycopg2.errors.UniqueViolation as e:
+        conn.rollback(); raise HTTPException(400, _unique_msg(e))
     finally: cur.close(); conn.close()
 
 @app.post("/api/hospitals/login")
@@ -712,8 +738,8 @@ def pharm_register(d: PharmReg):
         row = cur.fetchone(); conn.commit()
         tok = _session("pharmacy_sessions","pharmacy_id",row["id"])
         return {"success":True,"system_id":row["system_id"],"token":tok}
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback(); raise HTTPException(400,"Email already registered")
+    except psycopg2.errors.UniqueViolation as e:
+        conn.rollback(); raise HTTPException(400, _unique_msg(e))
     finally: cur.close(); conn.close()
 
 @app.post("/api/pharmacies/login")
