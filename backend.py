@@ -75,6 +75,24 @@ def _norm_name(v: str) -> str:
 def _norm_phone(v: str) -> str:
     return re.sub(r"\D+", "", (v or ""))
 
+def _personal_name_match(saved_norm: str, doc_name: str) -> bool:
+    """
+    For Personal Doctor (name + phone): avoid substring false positives
+    (e.g. 'hiv kumar verma' must not match 'shiv kumar verma').
+    Requires exact normalized full name OR every saved word to appear as a whole token in the doctor name.
+    """
+    s = (saved_norm or "").strip()
+    d = _norm_name(doc_name)
+    if not s:
+        return True
+    if s == d:
+        return True
+    st = set(s.split())
+    dt = set(d.split())
+    if not st:
+        return False
+    return st <= dt
+
 def _hydrate_online_doctor(doc: dict) -> dict:
     # If live in-memory presence lacks profile metadata, enrich from DB by name.
     if (doc.get("country") and doc.get("phone")) or not doc.get("name"):
@@ -357,10 +375,18 @@ def get_online_doctors(
         online = [d for d in online if (d.get("country") or "").strip().lower() == c]
     if ci:
         online = [d for d in online if (d.get("city") or "").strip().lower() == ci]
-    if dn:
-        online = [d for d in online if dn in _norm_name(d.get("name") or "")]
-    if dp:
-        online = [d for d in online if dp and dp in _norm_phone(d.get("phone") or "")]
+    # Personal mode: both name + phone → strict whole-token name match (not substring)
+    if dn and dp:
+        online = [
+            d for d in online
+            if _personal_name_match(dn, d.get("name") or "")
+            and dp in _norm_phone(d.get("phone") or "")
+        ]
+    else:
+        if dn:
+            online = [d for d in online if dn in _norm_name(d.get("name") or "")]
+        if dp:
+            online = [d for d in online if dp and dp in _norm_phone(d.get("phone") or "")]
     if hn:
         online = [d for d in online if hn in (d.get("hospital_name") or "").strip().lower()]
     if hr:
