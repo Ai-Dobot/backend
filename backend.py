@@ -93,25 +93,32 @@ def init_db():
             id SERIAL PRIMARY KEY, system_id TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
             country TEXT, city TEXT, address TEXT, phone TEXT, registration_no TEXT,
+            approval_status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS reg_doctors (
             id SERIAL PRIMARY KEY, system_id TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
             specialty TEXT, country TEXT, city TEXT, phone TEXT,
             qualifications TEXT, bio TEXT, avatar TEXT DEFAULT '👨‍⚕️',
+            license_doc_url TEXT,
             hospital_id INTEGER REFERENCES hospitals(id) ON DELETE SET NULL,
             is_online BOOLEAN DEFAULT FALSE, is_public BOOLEAN DEFAULT TRUE,
-            consultation_fee NUMERIC(10,2) DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW())""")
+            consultation_fee NUMERIC(10,2) DEFAULT 0,
+            approval_status TEXT DEFAULT 'pending',
+            created_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS patients (
             id SERIAL PRIMARY KEY, system_id TEXT UNIQUE NOT NULL,
             password_hash TEXT, name TEXT, email TEXT, phone TEXT,
             country TEXT, city TEXT, date_of_birth DATE,
             personal_doctor_id INTEGER REFERENCES reg_doctors(id) ON DELETE SET NULL,
+            approval_status TEXT DEFAULT 'approved',
             created_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS pharmacies (
             id SERIAL PRIMARY KEY, system_id TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
             country TEXT, city TEXT, address TEXT, phone TEXT, license_no TEXT,
+            license_doc_url TEXT,
+            approval_status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS medicines (
             id SERIAL PRIMARY KEY, pharmacy_id INTEGER REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -312,10 +319,122 @@ def end_call(call_id: str):
 
 
 # ══════════════════════════════════════════════════════════
+# ADMIN PORTAL (owner only)
+# ══════════════════════════════════════════════════════════
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "aidoBot-admin-2026!")
+
+def _is_admin(authorization: str = None):
+    return _bearer(authorization) == ADMIN_TOKEN
+
+@app.post("/api/admin/login")
+def admin_login(data: dict):
+    if data.get("password") == ADMIN_TOKEN:
+        return {"ok": True, "token": ADMIN_TOKEN}
+    raise HTTPException(401, "Wrong password")
+
+@app.get("/api/admin/pending")
+def admin_pending(authorization: str = None):
+    if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id,system_id,name,email,country,city,phone,qualifications,license_doc_url,approval_status,created_at FROM reg_doctors WHERE approval_status='pending' ORDER BY created_at DESC")
+    docs = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT id,system_id,name,email,country,city,phone,license_no,license_doc_url,approval_status,created_at FROM pharmacies WHERE approval_status='pending' ORDER BY created_at DESC")
+    pharms = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT id,system_id,name,email,country,city,phone,registration_no,approval_status,created_at FROM hospitals ORDER BY created_at DESC")
+    hosps = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT id,system_id,name,email,country,phone,approval_status,created_at FROM patients ORDER BY created_at DESC")
+    pats = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"doctors": docs, "pharmacies": pharms, "hospitals": hosps, "patients": pats}
+
+@app.post("/api/admin/approve")
+def admin_approve(data: dict, authorization: str = None):
+    if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
+    entity_type = data.get("type")    # "doctor", "pharmacy", "hospital"
+    entity_id   = data.get("id")
+    action      = data.get("action", "approved")   # "approved" or "rejected"
+    table_map = {"doctor": "reg_doctors", "pharmacy": "pharmacies", "hospital": "hospitals", "patient": "patients"}
+    table = table_map.get(entity_type)
+    if not table: raise HTTPException(400, "Invalid type")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(f"UPDATE {table} SET approval_status=%s WHERE id=%s RETURNING name,email", (action, entity_id))
+    row = cur.fetchone()
+    if not row: raise HTTPException(404, "Not found")
+    conn.commit(); cur.close(); conn.close()
+    return {"success": True, "message": f"{row['name']} ({row['email']}) {action}"}
+
+@app.get("/api/admin/stats")
+def admin_stats(authorization: str = None):
+    if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT approval_status, COUNT(*) FROM reg_doctors GROUP BY approval_status")
+    doc_stats = {r["approval_status"]: r["count"] for r in cur.fetchall()}
+    cur.execute("SELECT approval_status, COUNT(*) FROM pharmacies GROUP BY approval_status")
+    pharm_stats = {r["approval_status"]: r["count"] for r in cur.fetchall()}
+    cur.execute("SELECT COUNT(*) as c FROM hospitals")
+    hosp_count = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM patients")
+    pat_count = cur.fetchone()["c"]
+    cur.close(); conn.close()
+    return {
+        "doctors": doc_stats, "pharmacies": pharm_stats,
+        "hospitals": hosp_count, "patients": pat_count
+    }
+
+
+
+# ══════════════════════════════════════════════════════════
 # NEW: HOSPITAL REGISTRATION (Neon DB)
 # ══════════════════════════════════════════════════════════
 class LoginReq(BaseModel):
     email: str; password: str
+
+class RegDoctorCreate(BaseModel):
+    name:str; email:str; password:str; specialty:Optional[str]=None
+    country:Optional[str]=None; city:Optional[str]=None; phone:Optional[str]=None
+    qualifications:Optional[str]=None; bio:Optional[str]=None
+    avatar:Optional[str]="👨‍⚕️"; consultation_fee:Optional[float]=0
+    license_doc_url:Optional[str]=None
+
+@app.post("/api/reg_doctors/register")
+def reg_doctor_register(d: RegDoctorCreate):
+    sid = _gen_id("DOC"); conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""INSERT INTO reg_doctors
+            (system_id,name,email,password_hash,specialty,country,city,phone,qualifications,bio,avatar,consultation_fee,license_doc_url)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
+            (sid,d.name,d.email,_hash(d.password),d.specialty,d.country,d.city,d.phone,
+             d.qualifications,d.bio,d.avatar,d.consultation_fee,d.license_doc_url))
+        row = cur.fetchone(); conn.commit()
+        return {"success":True,"system_id":row["system_id"],
+                "message":"Registration submitted. Please wait for admin approval before signing in."}
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback(); raise HTTPException(400,"Email already registered")
+    finally: cur.close(); conn.close()
+
+@app.post("/api/reg_doctors/login")
+def reg_doctor_login(d: LoginReq):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM reg_doctors WHERE email=%s AND password_hash=%s",(d.email,_hash(d.password)))
+    doc = cur.fetchone(); cur.close(); conn.close()
+    if not doc: raise HTTPException(401,"Invalid credentials")
+    if doc.get("approval_status","pending") == "pending":
+        raise HTTPException(403,"Your registration is pending admin approval. You will be notified when approved.")
+    if doc.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your registration was not approved. Please contact support.")
+    tok = _session("reg_doctor_sessions","reg_doctor_id",doc["id"])
+    r = dict(doc); r.pop("password_hash",None)
+    return {"success":True,"token":tok,"doctor":r}
+
+@app.get("/api/reg_doctors/me")
+def reg_doctor_me(authorization: str = None):
+    sess = _verify("reg_doctor_sessions",_bearer(authorization))
+    if not sess: raise HTTPException(401,"Unauthorized")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id,system_id,name,email,specialty,country,city,phone,qualifications,bio,avatar,consultation_fee,approval_status FROM reg_doctors WHERE id=%s",(sess["reg_doctor_id"],))
+    doc = cur.fetchone(); cur.close(); conn.close()
+    return dict(doc) if doc else {}
+
 
 class HospReg(BaseModel):
     name:str; email:str; password:str
@@ -331,7 +450,8 @@ def hosp_register(d: HospReg):
             (sid,d.name,d.email,_hash(d.password),d.country,d.city,d.address,d.phone,d.registration_no))
         row = cur.fetchone(); conn.commit()
         tok = _session("hospital_sessions","hospital_id",row["id"])
-        return {"success":True,"system_id":row["system_id"],"token":tok}
+        return {"success":True,"system_id":row["system_id"],"token":tok,
+                "message":"Registration submitted. Please wait for admin approval before signing in."}
     except psycopg2.errors.UniqueViolation:
         conn.rollback(); raise HTTPException(400,"Email already registered")
     finally: cur.close(); conn.close()
@@ -342,6 +462,10 @@ def hosp_login(d: LoginReq):
     cur.execute("SELECT * FROM hospitals WHERE email=%s AND password_hash=%s",(d.email,_hash(d.password)))
     h = cur.fetchone(); cur.close(); conn.close()
     if not h: raise HTTPException(401,"Invalid credentials")
+    if h.get("approval_status","approved") == "pending":
+        raise HTTPException(403,"Your registration is pending admin approval. You will be notified when approved.")
+    if h.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your registration was not approved. Please contact support.")
     tok = _session("hospital_sessions","hospital_id",h["id"])
     r = dict(h); r.pop("password_hash",None)
     return {"success":True,"token":tok,"hospital":r}
@@ -476,14 +600,15 @@ class PharmReg(BaseModel):
     name:str; email:str; password:str
     country:Optional[str]=None; city:Optional[str]=None
     address:Optional[str]=None; phone:Optional[str]=None; license_no:Optional[str]=None
+    license_doc_url:Optional[str]=None
 
 @app.post("/api/pharmacies/register")
 def pharm_register(d: PharmReg):
     sid = _gen_id("PHM"); conn = get_conn(); cur = conn.cursor()
     try:
-        cur.execute("""INSERT INTO pharmacies (system_id,name,email,password_hash,country,city,address,phone,license_no)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
-            (sid,d.name,d.email,_hash(d.password),d.country,d.city,d.address,d.phone,d.license_no))
+        cur.execute("""INSERT INTO pharmacies (system_id,name,email,password_hash,country,city,address,phone,license_no,license_doc_url)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
+            (sid,d.name,d.email,_hash(d.password),d.country,d.city,d.address,d.phone,d.license_no,getattr(d,'license_doc_url',None)))
         row = cur.fetchone(); conn.commit()
         tok = _session("pharmacy_sessions","pharmacy_id",row["id"])
         return {"success":True,"system_id":row["system_id"],"token":tok}
@@ -497,6 +622,10 @@ def pharm_login(d: LoginReq):
     cur.execute("SELECT * FROM pharmacies WHERE email=%s AND password_hash=%s",(d.email,_hash(d.password)))
     p = cur.fetchone(); cur.close(); conn.close()
     if not p: raise HTTPException(401,"Invalid credentials")
+    if p.get("approval_status","pending") == "pending":
+        raise HTTPException(403,"Your pharmacy registration is pending admin approval.")
+    if p.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your pharmacy registration was not approved.")
     tok = _session("pharmacy_sessions","pharmacy_id",p["id"])
     r = dict(p); r.pop("password_hash",None)
     return {"success":True,"token":tok,"pharmacy":r}
