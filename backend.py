@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
-import requests, os, json, uuid, time
+import requests, os, json, uuid, time, re
 # Auto-install psycopg2-binary if not present (handles Render build cache issues)
 import subprocess, sys
 try:
@@ -66,6 +66,14 @@ def _online_doctors():
         for did, d in doctors.items()
         if d.get("last_seen", 0) > cutoff
     ]
+
+def _norm_name(v: str) -> str:
+    v = (v or "").strip().lower()
+    v = re.sub(r"^dr\.?\s+", "", v)
+    return re.sub(r"\s+", " ", v)
+
+def _norm_phone(v: str) -> str:
+    return re.sub(r"\D+", "", (v or ""))
 
 
 # ══════════════════════════════════════════════════════════
@@ -306,8 +314,8 @@ def get_online_doctors(
     online = _online_doctors()
     c = (country or "").strip().lower()
     ci = (city or "").strip().lower()
-    dn = (doctor_name or "").strip().lower()
-    dp = (doctor_phone or "").strip().lower()
+    dn = _norm_name(doctor_name or "")
+    dp = _norm_phone(doctor_phone or "")
     hn = (hospital_name or "").strip().lower()
     hr = (hospital_reg_no or "").strip().lower()
 
@@ -316,9 +324,9 @@ def get_online_doctors(
     if ci:
         online = [d for d in online if (d.get("city") or "").strip().lower() == ci]
     if dn:
-        online = [d for d in online if dn in (d.get("name") or "").strip().lower()]
+        online = [d for d in online if dn in _norm_name(d.get("name") or "")]
     if dp:
-        online = [d for d in online if (d.get("phone") or "").strip().lower() == dp]
+        online = [d for d in online if dp and dp in _norm_phone(d.get("phone") or "")]
     if hn:
         online = [d for d in online if hn in (d.get("hospital_name") or "").strip().lower()]
     if hr:
@@ -336,6 +344,8 @@ def get_online_doctors(
 class PatientCall(BaseModel):
     patient_name: str; patient_id: str; symptom: str
     doctor_id: Optional[str] = None
+    doctor_name: Optional[str] = None
+    doctor_phone: Optional[str] = None
     hospital_name: Optional[str] = None
     hospital_reg_no: Optional[str] = None
 
@@ -381,10 +391,27 @@ def initiate_call(call: PatientCall):
     call_id = str(uuid.uuid4())[:8]
     video_call_url = f"https://meet.jit.si/ai-dobot-{call_id}"
 
-    targets = (
-        [doctors[call.doctor_id]] if call.doctor_id and call.doctor_id in doctors
-        else [doctors[d["doctor_id"]] for d in online]
-    )
+    if call.doctor_id and call.doctor_id in doctors:
+        targets = [doctors[call.doctor_id]]
+    elif call.doctor_name or call.doctor_phone:
+        n = _norm_name(call.doctor_name or "")
+        p = _norm_phone(call.doctor_phone or "")
+        targets = []
+        for d in online:
+            name_ok = (not n) or (n in _norm_name(d.get("name") or ""))
+            phone_ok = (not p) or (p in _norm_phone(d.get("phone") or ""))
+            if name_ok and phone_ok:
+                targets.append(doctors[d["doctor_id"]])
+        if not targets and n:
+            # fallback: if phone mismatched, allow name-only match
+            for d in online:
+                if n in _norm_name(d.get("name") or ""):
+                    targets.append(doctors[d["doctor_id"]])
+    else:
+        targets = [doctors[d["doctor_id"]] for d in online]
+
+    if not targets:
+        raise HTTPException(404, "No matching online doctor found.")
 
     success = 0
     for d in targets:
