@@ -7,6 +7,9 @@ ENVIRONMENT VARIABLES:
   FIREBASE_SERVICE_ACCOUNT  → paste full Firebase service account JSON
   FIREBASE_PROJECT_ID       → ai-dobot
   DATABASE_URL              → Neon PostgreSQL connection string
+  CLOUDINARY_CLOUD_NAME     → Cloudinary cloud name (medicine images)
+  CLOUDINARY_API_KEY        → Cloudinary API key
+  CLOUDINARY_API_SECRET     → Cloudinary API secret
 
 HOW IT CONNECTS:
   Doctor app (GitHub Pages) ──sign in──► POST /api/doctor/signin
@@ -15,7 +18,7 @@ HOW IT CONNECTS:
   Hospital/Patient/Pharmacy portals ► /api/hospitals /api/patients /api/pharmacies
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
@@ -27,6 +30,13 @@ try:
 except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'psycopg2-binary', '-q'])
 import psycopg2, psycopg2.extras, hashlib, secrets, string, random
+try:
+    import cloudinary
+    import cloudinary.uploader
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'cloudinary', '-q'])
+    import cloudinary
+    import cloudinary.uploader
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
@@ -160,6 +170,26 @@ def _verify(table, token):
     row = cur.fetchone(); cur.close(); conn.close()
     return dict(row) if row else None
 
+def _cloudinary_upload_bytes(data: bytes, folder: str = "medicines") -> str:
+    cn = os.getenv("CLOUDINARY_CLOUD_NAME")
+    ak = os.getenv("CLOUDINARY_API_KEY")
+    sec = os.getenv("CLOUDINARY_API_SECRET")
+    if not cn or not ak or not sec:
+        raise HTTPException(
+            503,
+            "Image upload not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET on Render.",
+        )
+    cloudinary.config(cloud_name=cn, api_key=ak, api_secret=sec)
+    try:
+        res = cloudinary.uploader.upload(data, folder=folder, resource_type="image")
+    except Exception as e:
+        raise HTTPException(500, f"Cloudinary upload failed: {e!s}")
+    url = (res.get("secure_url") or res.get("url") or "").strip()
+    if not url:
+        raise HTTPException(500, "Cloudinary returned no image URL")
+    return url
+
+
 def init_db():
     try:
         conn = get_conn(); cur = conn.cursor()
@@ -242,6 +272,14 @@ def init_db():
                 END LOOP;
             END $$;
         """)
+        # Pharmacy / shop / medicine image (migrations for existing DBs)
+        cur.execute("ALTER TABLE medicines ADD COLUMN IF NOT EXISTS image_url TEXT")
+        cur.execute("ALTER TABLE medicines ADD COLUMN IF NOT EXISTS diagnosis TEXT")
+        cur.execute("ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS region TEXT")
+        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email TEXT")
+        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT")
+        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_phone TEXT")
+        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending'")
         conn.commit(); cur.close(); conn.close()
         print("DB init OK")
     except Exception as e:
@@ -289,8 +327,108 @@ def send_fcm(token, title, body, data):
 # ══════════════════════════════════════════════════════════
 # STARTUP
 # ══════════════════════════════════════════════════════════
+def seed_demo_boxing_pharmacy():
+    """
+    Demo pharmacy + ~20 sample medicines (external image URLs) for testing.
+    Disable: set env SEED_BOXING_DEMO=0
+    Sign in: email boxing.demo@sample-delete.local  password SampleBoxing2024!
+    """
+    if os.getenv("SEED_BOXING_DEMO", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    DEMO_EMAIL = "boxing.demo@sample-delete.local"
+    DEMO_SYSTEM = "PHM-BOXINGDEMO"
+    SAMPLE_MEDS = [
+        {"name": "Paracetamol 500mg", "brand": "Boxing Relief", "category": "Pain Relief", "description": "Pain and fever relief.", "dosage": "1–2 tablets every 4–6h", "diagnosis": "Headache, mild pain, fever", "price": 4.99, "stock": 200, "rx": False, "img": "https://images.unsplash.com/photo-1584308666744-24d5c474e870?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Ibuprofen 200mg", "brand": "Boxing Relief", "category": "Pain Relief", "description": "Anti-inflammatory pain relief.", "dosage": "1 tablet every 6–8h with food", "diagnosis": "Inflammation, muscle pain", "price": 6.49, "stock": 150, "rx": False, "img": "https://images.unsplash.com/photo-1587854692152-cbe660dbde88?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Vitamin D3 1000 IU", "brand": "SunBox", "category": "Vitamins", "description": "Daily vitamin D support.", "dosage": "1 softgel daily", "diagnosis": "Vitamin D deficiency support", "price": 12.99, "stock": 120, "rx": False, "img": "https://images.unsplash.com/photo-1550572017-edd951aa8f45?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Multivitamin Adults", "brand": "VitalBox", "category": "Vitamins", "description": "Broad-spectrum daily vitamins.", "dosage": "1 tablet daily with meal", "diagnosis": "General wellness", "price": 18.5, "stock": 90, "rx": False, "img": "https://images.unsplash.com/photo-1471864195440-6b9b8d524493?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Cetirizine 10mg", "brand": "AllerBox", "category": "Other", "description": "24h allergy relief.", "dosage": "1 tablet daily", "diagnosis": "Allergic rhinitis, hives", "price": 9.25, "stock": 180, "rx": False, "img": "https://images.unsplash.com/photo-1584308666744-24d5c474e870?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Loratadine 10mg", "brand": "AllerBox", "category": "Other", "description": "Non-drowsy antihistamine.", "dosage": "1 tablet daily", "diagnosis": "Seasonal allergies", "price": 8.75, "stock": 160, "rx": False, "img": "https://images.unsplash.com/photo-1631549916766-7429e6950018?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Omeprazole 20mg", "brand": "AcidBox", "category": "Other", "description": "Reduces stomach acid.", "dosage": "1 capsule before breakfast", "diagnosis": "Acid reflux, GERD (OTC use)", "price": 14.0, "stock": 100, "rx": False, "img": "https://images.unsplash.com/photo-1587854692152-cbe660dbde88?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Saline Nasal Spray", "brand": "ClearBox", "category": "Cold & Flu", "description": "Sterile saline rinse.", "dosage": "2–6 sprays per nostril", "diagnosis": "Dry nose, congestion rinse", "price": 5.5, "stock": 220, "rx": False, "img": "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Hydrocortisone Cream 1%", "brand": "SkinBox", "category": "Skin", "description": "Mild steroid cream for irritation.", "dosage": "Thin layer 2–3x daily", "diagnosis": "Eczema, insect bites", "price": 7.99, "stock": 85, "rx": False, "img": "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Aspirin 81mg Low Dose", "brand": "CardioBox", "category": "Heart", "description": "Low-dose aspirin.", "dosage": "As directed by physician", "diagnosis": "Cardiovascular prevention (Rx guidance)", "price": 6.0, "stock": 300, "rx": False, "img": "https://images.unsplash.com/photo-1584308666744-24d5c474e870?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Amoxicillin 500mg", "brand": "PharmaBox", "category": "Antibiotics", "description": "Antibiotic — prescription only.", "dosage": "Per prescription", "diagnosis": "Bacterial infections", "price": 22.0, "stock": 60, "rx": True, "img": "https://images.unsplash.com/photo-1471864195440-6b9b8d524493?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Azithromycin 250mg", "brand": "PharmaBox", "category": "Antibiotics", "description": "Macrolide antibiotic.", "dosage": "Per prescription", "diagnosis": "Respiratory bacterial infection", "price": 28.5, "stock": 45, "rx": True, "img": "https://images.unsplash.com/photo-1587854692152-cbe660dbde88?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Metformin 500mg", "brand": "DiabetBox", "category": "Diabetes", "description": "Blood sugar management.", "dosage": "Per prescription", "diagnosis": "Type 2 diabetes", "price": 15.75, "stock": 110, "rx": True, "img": "https://images.unsplash.com/photo-1579684385127-1ef15d508118?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Atorvastatin 20mg", "brand": "LipidBox", "category": "Heart", "description": "Cholesterol management.", "dosage": "Per prescription", "diagnosis": "High cholesterol", "price": 19.99, "stock": 70, "rx": True, "img": "https://images.unsplash.com/photo-1550572017-edd951aa8f45?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Electrolyte Powder", "brand": "HydroBox", "category": "Vitamins", "description": "Rehydration mix.", "dosage": "1 sachet in 200ml water", "diagnosis": "Dehydration, sports recovery", "price": 11.25, "stock": 140, "rx": False, "img": "https://images.unsplash.com/photo-1514996937319-344454492b37?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Zinc Lozenges", "brand": "ImmunoBox", "category": "Cold & Flu", "description": "Immune support lozenges.", "dosage": "1 lozenge every 2h when needed", "diagnosis": "Cold symptom support", "price": 8.99, "stock": 95, "rx": False, "img": "https://images.unsplash.com/photo-1584308666744-24d5c474e870?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Antiseptic Solution 500ml", "brand": "FirstBox", "category": "Other", "description": "Wound cleansing.", "dosage": "Apply to clean wound", "diagnosis": "Minor cuts and grazes", "price": 6.75, "stock": 75, "rx": False, "img": "https://images.unsplash.com/photo-1583947215259-38e31be8751f?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Digital Thermometer", "brand": "TempBox", "category": "Other", "description": "Fast oral/axillary reading.", "dosage": "N/A", "diagnosis": "Fever monitoring", "price": 24.99, "stock": 40, "rx": False, "img": "https://images.unsplash.com/photo-1584036561566-baf8f0f1d1cc?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Hand Sanitizer 500ml", "brand": "CleanBox", "category": "Skin", "description": "70% alcohol gel.", "dosage": "Rub hands until dry", "diagnosis": "Hygiene", "price": 7.25, "stock": 250, "rx": False, "img": "https://images.unsplash.com/photo-1584483766114-3cea5b5bab87?w=400&q=80&auto=format&fit=crop"},
+        {"name": "Probiotic Capsules", "brand": "GutBox", "category": "Vitamins", "description": "Digestive flora support.", "dosage": "1 capsule daily", "diagnosis": "Digestive wellness", "price": 21.5, "stock": 65, "rx": False, "img": "https://images.unsplash.com/photo-1550572017-edd951aa8f45?w=400&q=80&auto=format&fit=crop"},
+    ]
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM pharmacies WHERE email=%s OR system_id=%s", (DEMO_EMAIL, DEMO_SYSTEM))
+        row = cur.fetchone()
+        if row:
+            pid = row["id"]
+        else:
+            cur.execute(
+                """INSERT INTO pharmacies (system_id,name,email,username,password_hash,country,region,city,address,phone,license_no,license_doc_url,approval_status)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'approved') RETURNING id""",
+                (
+                    DEMO_SYSTEM,
+                    "Boxing Pharmacy",
+                    DEMO_EMAIL,
+                    None,
+                    _hash("SampleBoxing2024!"),
+                    "United States",
+                    "California",
+                    "Los Angeles",
+                    "123 Demo Street (sample — delete later)",
+                    "+1-555-010-BOX",
+                    "DEMO-LIC-BOXING",
+                    "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+                ),
+            )
+            pid = cur.fetchone()["id"]
+        cur.execute("SELECT COUNT(*) AS c FROM medicines WHERE pharmacy_id=%s", (pid,))
+        have = int(cur.fetchone()["c"] or 0)
+        need = max(0, 20 - have)
+        if need == 0:
+            conn.commit()
+            return
+        start = have
+        for i in range(need):
+            m = SAMPLE_MEDS[start + i]
+            cur.execute(
+                """INSERT INTO medicines (pharmacy_id,name,brand,category,description,dosage,diagnosis,price,stock,requires_prescription,image_url)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    pid,
+                    m["name"],
+                    m["brand"],
+                    m["category"],
+                    m["description"],
+                    m["dosage"],
+                    m["diagnosis"],
+                    m["price"],
+                    m["stock"],
+                    m["rx"],
+                    m["img"],
+                ),
+            )
+        conn.commit()
+        print(f"Demo Boxing Pharmacy seeded: pharmacy_id={pid}, added {need} sample medicines.")
+    except Exception as e:
+        conn.rollback()
+        print(f"Demo seed skipped: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
 @app.on_event("startup")
-def startup(): init_db()
+def startup():
+    init_db()
+    try:
+        seed_demo_boxing_pharmacy()
+    except Exception as e:
+        print(f"startup seed (non-fatal): {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -565,7 +703,7 @@ def admin_pending(authorization: Optional[str] = Header(default=None)):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT id,system_id,name,email,country,city,phone,qualifications,license_doc_url,approval_status,created_at FROM reg_doctors ORDER BY approval_status='pending' DESC, created_at DESC")
     docs = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT id,system_id,name,email,country,city,phone,license_no,license_doc_url,approval_status,created_at FROM pharmacies ORDER BY approval_status='pending' DESC, created_at DESC")
+    cur.execute("SELECT id,system_id,name,email,country,region,city,phone,license_no,license_doc_url,approval_status,created_at FROM pharmacies ORDER BY approval_status='pending' DESC, created_at DESC")
     pharms = [dict(r) for r in cur.fetchall()]
     cur.execute("SELECT id,system_id,name,email,country,city,phone,registration_no,approval_status,created_at FROM hospitals ORDER BY created_at DESC")
     hosps = [dict(r) for r in cur.fetchall()]
@@ -608,6 +746,47 @@ def admin_stats(authorization: Optional[str] = Header(default=None)):
         "hospitals": hosp_count, "patients": pat_count
     }
 
+
+@app.get("/api/admin/pharmacies/{pharmacy_id}/medicines")
+def admin_pharmacy_medicines(pharmacy_id: int, authorization: Optional[str] = Header(default=None)):
+    if not _is_admin(authorization):
+        raise HTTPException(401, "Unauthorized")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, system_id, name FROM pharmacies WHERE id=%s", (pharmacy_id,))
+    ph = cur.fetchone()
+    if not ph:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Pharmacy not found")
+    cur.execute(
+        """SELECT id, name, brand, category, description, dosage, diagnosis, price, stock,
+                  requires_prescription, image_url, created_at
+           FROM medicines WHERE pharmacy_id=%s ORDER BY name""",
+        (pharmacy_id,),
+    )
+    meds = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return {"pharmacy": dict(ph), "medicines": meds, "count": len(meds)}
+
+
+@app.delete("/api/admin/medicines/{med_id}")
+def admin_delete_medicine(med_id: int, authorization: Optional[str] = Header(default=None)):
+    if not _is_admin(authorization):
+        raise HTTPException(401, "Unauthorized")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM medicines WHERE id=%s RETURNING id", (med_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Medicine not found")
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"success": True, "deleted_id": med_id}
 
 
 # ══════════════════════════════════════════════════════════
@@ -929,7 +1108,9 @@ def set_personal_doctor(data: dict, authorization: Optional[str] = Header(defaul
 class PharmReg(BaseModel):
     name:str; email:str; password:str
     username:Optional[str]=None
-    country:Optional[str]=None; city:Optional[str]=None
+    country:Optional[str]=None
+    region:Optional[str]=None
+    city:Optional[str]=None
     address:Optional[str]=None; phone:Optional[str]=None; license_no:Optional[str]=None
     license_doc_url:Optional[str]=None
 
@@ -937,9 +1118,9 @@ class PharmReg(BaseModel):
 def pharm_register(d: PharmReg):
     sid = _gen_id("PHM"); conn = get_conn(); cur = conn.cursor()
     try:
-        cur.execute("""INSERT INTO pharmacies (system_id,name,email,username,password_hash,country,city,address,phone,license_no,license_doc_url)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
-            (sid,d.name,d.email,(d.username or "").strip() or None,_hash(d.password),d.country,d.city,d.address,d.phone,d.license_no,getattr(d,'license_doc_url',None)))
+        cur.execute("""INSERT INTO pharmacies (system_id,name,email,username,password_hash,country,region,city,address,phone,license_no,license_doc_url)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,system_id""",
+            (sid,d.name,d.email,(d.username or "").strip() or None,_hash(d.password),d.country,d.region,d.city,d.address,d.phone,d.license_no,getattr(d,'license_doc_url',None)))
         row = cur.fetchone(); conn.commit()
         tok = _session("pharmacy_sessions","pharmacy_id",row["id"])
         return {"success":True,"system_id":row["system_id"],"token":tok}
@@ -996,23 +1177,100 @@ def pharm_me(authorization: Optional[str] = Header(default=None)):
     sess = _verify("pharmacy_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id,system_id,name,email,country,city,address,phone,license_no FROM pharmacies WHERE id=%s",(sess["pharmacy_id"],))
+    cur.execute("SELECT id,system_id,name,email,country,region,city,address,phone,license_no FROM pharmacies WHERE id=%s",(sess["pharmacy_id"],))
     p = cur.fetchone(); cur.close(); conn.close()
     return dict(p) if p else {}
 
+
+class PharmLocationPatch(BaseModel):
+    country: Optional[str] = None
+    region: Optional[str] = None
+    city: Optional[str] = None
+
+
+@app.patch("/api/pharmacies/location")
+def pharm_patch_location(d: PharmLocationPatch, authorization: Optional[str] = Header(default=None)):
+    sess = _verify("pharmacy_sessions", _bearer(authorization))
+    if not sess:
+        raise HTTPException(401, "Unauthorized")
+    conn = get_conn()
+    cur = conn.cursor()
+    sets, vals = [], []
+    if d.country is not None:
+        sets.append("country=%s")
+        vals.append(d.country.strip() or None)
+    if d.region is not None:
+        sets.append("region=%s")
+        vals.append(d.region.strip() or None)
+    if d.city is not None:
+        sets.append("city=%s")
+        vals.append(d.city.strip() or None)
+    if not sets:
+        cur.close()
+        conn.close()
+        raise HTTPException(400, "No fields to update")
+    vals.append(sess["pharmacy_id"])
+    cur.execute(f"UPDATE pharmacies SET {', '.join(sets)} WHERE id=%s", vals)
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"success": True}
+
+
+@app.post("/api/pharmacies/medicine-image")
+async def upload_medicine_image(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    sess = _verify("pharmacy_sessions", _bearer(authorization))
+    if not sess:
+        raise HTTPException(401, "Unauthorized")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Empty file")
+    if len(raw) > 8 * 1024 * 1024:
+        raise HTTPException(400, "Image too large (max 8 MB)")
+    ct = (file.content_type or "").lower()
+    if ct and not ct.startswith("image/"):
+        raise HTTPException(400, "File must be an image")
+    url = _cloudinary_upload_bytes(raw, folder="medicines")
+    return {"success": True, "url": url}
+
+
 class MedCreate(BaseModel):
-    name:str; brand:Optional[str]=None; category:Optional[str]=None
-    description:Optional[str]=None; dosage:Optional[str]=None
-    price:float; stock:int=0; requires_prescription:bool=False
+    name: str
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    dosage: Optional[str] = None
+    diagnosis: Optional[str] = None
+    price: float
+    stock: int = 0
+    requires_prescription: bool = False
+    image_url: Optional[str] = None
 
 @app.post("/api/pharmacies/medicines")
 def add_medicine(d: MedCreate, authorization: Optional[str] = Header(default=None)):
     sess = _verify("pharmacy_sessions",_bearer(authorization))
     if not sess: raise HTTPException(401,"Unauthorized")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("""INSERT INTO medicines (pharmacy_id,name,brand,category,description,dosage,price,stock,requires_prescription)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-        (sess["pharmacy_id"],d.name,d.brand,d.category,d.description,d.dosage,d.price,d.stock,d.requires_prescription))
+    cur.execute(
+        """INSERT INTO medicines (pharmacy_id,name,brand,category,description,dosage,diagnosis,price,stock,requires_prescription,image_url)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (
+            sess["pharmacy_id"],
+            d.name,
+            d.brand,
+            d.category,
+            d.description,
+            d.dosage,
+            d.diagnosis,
+            d.price,
+            d.stock,
+            d.requires_prescription,
+            (d.image_url or "").strip() or None,
+        ),
+    )
     row = cur.fetchone(); conn.commit(); cur.close(); conn.close()
     return {"success":True,"medicine_id":row["id"]}
 
@@ -1034,32 +1292,166 @@ def delete_medicine(med_id: int, authorization: Optional[str] = Header(default=N
     conn.commit(); cur.close(); conn.close()
     return {"success":True}
 
+
+class MedUpdate(BaseModel):
+    name: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    dosage: Optional[str] = None
+    diagnosis: Optional[str] = None
+    price: Optional[float] = None
+    stock: Optional[int] = None
+    requires_prescription: Optional[bool] = None
+    image_url: Optional[str] = None
+
+
+@app.put("/api/pharmacies/medicines/{med_id}")
+def update_medicine(med_id: int, d: MedUpdate, authorization: Optional[str] = Header(default=None)):
+    sess = _verify("pharmacy_sessions", _bearer(authorization))
+    if not sess:
+        raise HTTPException(401, "Unauthorized")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM medicines WHERE id=%s AND pharmacy_id=%s",
+        (med_id, sess["pharmacy_id"]),
+    )
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Medicine not found")
+    try:
+        data = d.model_dump(exclude_unset=True)
+    except AttributeError:
+        data = d.dict(exclude_unset=True)
+    if not data:
+        cur.close()
+        conn.close()
+        raise HTTPException(400, "No fields to update")
+    if "image_url" in data and data["image_url"] is not None:
+        data["image_url"] = (data["image_url"] or "").strip() or None
+    cols, vals = [], []
+    for k, v in data.items():
+        cols.append(f"{k}=%s")
+        vals.append(v)
+    vals.append(med_id)
+    vals.append(sess["pharmacy_id"])
+    cur.execute(
+        f"UPDATE medicines SET {', '.join(cols)} WHERE id=%s AND pharmacy_id=%s",
+        vals,
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"success": True, "medicine_id": med_id}
+
+@app.get("/api/shop/locations/countries")
+def shop_location_countries():
+    """Proxy country list (avoids browser CORS to third-party APIs)."""
+    try:
+        r = requests.get("https://countriesnow.space/api/v0.1/countries", timeout=25)
+        r.raise_for_status()
+        j = r.json()
+        names = sorted({x.get("country") for x in (j.get("data") or []) if x.get("country")})
+        return {"countries": names}
+    except Exception as e:
+        raise HTTPException(502, f"Could not load countries: {e!s}")
+
+
+@app.post("/api/shop/locations/states")
+def shop_location_states(data: dict):
+    """States/regions for a country (fallback: Nationwide)."""
+    country = (data.get("country") or "").strip()
+    if not country:
+        raise HTTPException(400, "country is required")
+    try:
+        r = requests.post(
+            "https://countriesnow.space/api/v0.1/countries/states",
+            json={"country": country},
+            timeout=25,
+        )
+        r.raise_for_status()
+        j = r.json()
+        states = [s.get("name") for s in (j.get("data", {}).get("states") or []) if s.get("name")]
+        if not states:
+            return {"states": ["Nationwide"]}
+        return {"states": sorted(set(states))}
+    except Exception:
+        return {"states": ["Nationwide"]}
+
+
 @app.get("/api/shop/medicines")
-def shop_medicines(country: str = None, category: str = None, search: str = None, page: int = 1):
-    conn = get_conn(); cur = conn.cursor()
-    q = """SELECT m.*,ph.name as pharmacy_name,ph.city as pharmacy_city,ph.country as pharmacy_country
-           FROM medicines m JOIN pharmacies ph ON m.pharmacy_id=ph.id WHERE m.stock>0"""
+def shop_medicines(
+    country: str = None,
+    region: str = None,
+    category: str = None,
+    search: str = None,
+    page: int = 1,
+):
+    conn = get_conn()
+    cur = conn.cursor()
+    q = """SELECT m.*,ph.name as pharmacy_name,ph.city as pharmacy_city,ph.country as pharmacy_country,
+                  ph.region as pharmacy_region
+           FROM medicines m JOIN pharmacies ph ON m.pharmacy_id=ph.id
+           WHERE m.stock>0 AND ph.approval_status='approved'"""
     p = []
-    if country: q += " AND ph.country ILIKE %s"; p.append(f"%{country}%")
-    if category: q += " AND m.category ILIKE %s"; p.append(f"%{category}%")
-    if search: q += " AND (m.name ILIKE %s OR m.brand ILIKE %s)"; p.extend([f"%{search}%",f"%{search}%"])
-    q += f" ORDER BY m.name LIMIT 20 OFFSET {(page-1)*20}"
-    cur.execute(q,p); rows = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
-    return {"medicines":rows,"page":page}
+    if country and country.strip():
+        q += " AND LOWER(TRIM(ph.country)) = LOWER(TRIM(%s))"
+        p.append(country.strip())
+    if region and region.strip():
+        rl = region.strip().lower()
+        if rl not in ("all", "nationwide", "*", "any"):
+            q += " AND LOWER(TRIM(COALESCE(ph.region,''))) = LOWER(TRIM(%s))"
+            p.append(region.strip())
+    if category and category.strip():
+        q += " AND m.category ILIKE %s"
+        p.append(f"%{category.strip()}%")
+    if search and search.strip():
+        q += " AND (m.name ILIKE %s OR m.brand ILIKE %s OR COALESCE(m.diagnosis,'') ILIKE %s)"
+        s = f"%{search.strip()}%"
+        p.extend([s, s, s])
+    q += f" ORDER BY m.name LIMIT 24 OFFSET {(page-1)*24}"
+    cur.execute(q, p)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return {"medicines": rows, "page": page}
 
 @app.post("/api/shop/order")
 def place_order(data: dict, authorization: Optional[str] = Header(default=None)):
-    sess = _verify("patient_sessions",_bearer(authorization))
+    tok = _bearer(authorization)
+    sess = _verify("patient_sessions", tok) if tok else None
     patient_id = sess["patient_id"] if sess else None
     items = data.get("items",[])
     if not items: raise HTTPException(400,"No items in order")
-    total = sum(i.get("price",0) * i.get("qty",1) for i in items)
+    total = sum(float(i.get("price",0) or 0) * int(i.get("qty",1) or 1) for i in items)
     pharmacy_id = items[0].get("pharmacy_id") if items else None
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT INTO orders (patient_id,pharmacy_id,items,total,delivery_address) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                (patient_id,pharmacy_id,psycopg2.extras.Json(items),total,data.get("delivery_address","")))
+    cur.execute(
+        """INSERT INTO orders (patient_id,pharmacy_id,items,total,delivery_address,
+           customer_email,customer_name,customer_phone,payment_status)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (
+            patient_id,
+            pharmacy_id,
+            psycopg2.extras.Json(items),
+            total,
+            (data.get("delivery_address") or "").strip(),
+            (data.get("customer_email") or "").strip() or None,
+            (data.get("customer_name") or "").strip() or None,
+            (data.get("customer_phone") or "").strip() or None,
+            "pending_payment",
+        ),
+    )
     row = cur.fetchone(); conn.commit(); cur.close(); conn.close()
-    return {"success":True,"order_id":row["id"],"total":total}
+    return {
+        "success": True,
+        "order_id": row["id"],
+        "total": total,
+        "payment_status": "pending_payment",
+        "message": "Order saved. Online payment can be connected later — status is pending_payment.",
+    }
 
 
 # ══════════════════════════════════════════════════════════
