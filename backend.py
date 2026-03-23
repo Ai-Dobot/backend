@@ -20,6 +20,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 import requests, os, json, uuid, time
+# Auto-install psycopg2-binary if not present (handles Render build cache issues)
+import subprocess, sys
+try:
+    import psycopg2
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'psycopg2-binary', '-q'])
 import psycopg2, psycopg2.extras, hashlib, secrets, string, random
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
