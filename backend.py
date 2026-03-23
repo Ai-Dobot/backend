@@ -342,9 +342,9 @@ def admin_login(data: dict):
 def admin_pending(authorization: str = None):
     if not _is_admin(authorization): raise HTTPException(401, "Unauthorized")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id,system_id,name,email,country,city,phone,qualifications,license_doc_url,approval_status,created_at FROM reg_doctors WHERE approval_status='pending' ORDER BY created_at DESC")
+    cur.execute("SELECT id,system_id,name,email,country,city,phone,qualifications,license_doc_url,approval_status,created_at FROM reg_doctors ORDER BY approval_status='pending' DESC, created_at DESC")
     docs = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT id,system_id,name,email,country,city,phone,license_no,license_doc_url,approval_status,created_at FROM pharmacies WHERE approval_status='pending' ORDER BY created_at DESC")
+    cur.execute("SELECT id,system_id,name,email,country,city,phone,license_no,license_doc_url,approval_status,created_at FROM pharmacies ORDER BY approval_status='pending' DESC, created_at DESC")
     pharms = [dict(r) for r in cur.fetchall()]
     cur.execute("SELECT id,system_id,name,email,country,city,phone,registration_no,approval_status,created_at FROM hospitals ORDER BY created_at DESC")
     hosps = [dict(r) for r in cur.fetchall()]
@@ -432,6 +432,25 @@ def reg_doctor_login(d: LoginReq):
     r = dict(doc); r.pop("password_hash",None)
     return {"success":True,"token":tok,"doctor":r}
 
+@app.post("/api/reg_doctors/login_by_sysid")
+def reg_doctor_login_sysid(data: dict):
+    name   = (data.get("name") or "").strip().lower()
+    sys_id = (data.get("system_id") or "").strip().upper()
+    if not name or not sys_id: raise HTTPException(400,"Name and System ID required")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM reg_doctors WHERE system_id=%s",(sys_id,))
+    doc = cur.fetchone(); cur.close(); conn.close()
+    if not doc: raise HTTPException(404,"System ID not found. Please check your ID.")
+    if doc["name"].strip().lower() != name:
+        raise HTTPException(401,"Name does not match our records for this System ID.")
+    if doc.get("approval_status","pending") == "pending":
+        raise HTTPException(403,"Your registration is pending admin approval.")
+    if doc.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your registration was not approved. Please contact support.")
+    tok = _session("reg_doctor_sessions","reg_doctor_id",doc["id"])
+    r = dict(doc); r.pop("password_hash",None)
+    return {"success":True,"token":tok,"doctor":r,"specialty":doc.get("specialty","")}
+
 @app.get("/api/reg_doctors/me")
 def reg_doctor_me(authorization: str = None):
     sess = _verify("reg_doctor_sessions",_bearer(authorization))
@@ -472,6 +491,25 @@ def hosp_login(d: LoginReq):
         raise HTTPException(403,"Your registration is pending admin approval. You will be notified when approved.")
     if h.get("approval_status") == "rejected":
         raise HTTPException(403,"Your registration was not approved. Please contact support.")
+    tok = _session("hospital_sessions","hospital_id",h["id"])
+    r = dict(h); r.pop("password_hash",None)
+    return {"success":True,"token":tok,"hospital":r}
+
+@app.post("/api/hospitals/login_by_sysid")
+def hosp_login_sysid(data: dict):
+    name   = (data.get("name") or "").strip().lower()
+    sys_id = (data.get("system_id") or "").strip().upper()
+    if not name or not sys_id: raise HTTPException(400,"Hospital name and System ID required")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM hospitals WHERE system_id=%s",(sys_id,))
+    h = cur.fetchone(); cur.close(); conn.close()
+    if not h: raise HTTPException(404,"System ID not found.")
+    if h["name"].strip().lower() != name:
+        raise HTTPException(401,"Hospital name does not match our records for this System ID.")
+    if h.get("approval_status","approved") == "pending":
+        raise HTTPException(403,"Your hospital registration is pending admin approval.")
+    if h.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your registration was not approved.")
     tok = _session("hospital_sessions","hospital_id",h["id"])
     r = dict(h); r.pop("password_hash",None)
     return {"success":True,"token":tok,"hospital":r}
@@ -568,6 +606,27 @@ def patient_login(d: PatientLogin):
     r = dict(u); r.pop("password_hash",None)
     return {"success":True,"token":tok,"patient":r}
 
+@app.post("/api/patients/login_by_sysid")
+def patient_login_sysid(data: dict):
+    name   = (data.get("name") or "").strip().lower()
+    sys_id = (data.get("system_id") or "").strip().upper()
+    if not name or not sys_id: raise HTTPException(400,"Name and System ID required")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM patients WHERE system_id=%s",(sys_id,))
+    u = cur.fetchone(); cur.close(); conn.close()
+    if not u: raise HTTPException(404,"System ID not found. Complete a robot Q&A session first.")
+    # If name is set, verify it — otherwise accept (first login after robot session)
+    if u.get("name") and u["name"].strip().lower() != name:
+        raise HTTPException(401,"Name does not match our records for this System ID.")
+    # Update name if not set yet
+    if not u.get("name"):
+        conn2 = get_conn(); cur2 = conn2.cursor()
+        cur2.execute("UPDATE patients SET name=%s WHERE id=%s",(data.get("name"),u["id"]))
+        conn2.commit(); cur2.close(); conn2.close()
+    tok = _session("patient_sessions","patient_id",u["id"])
+    r = dict(u); r.pop("password_hash",None)
+    return {"success":True,"token":tok,"patient":r}
+
 @app.get("/api/patients/me")
 def patient_me(authorization: str = None):
     sess = _verify("patient_sessions",_bearer(authorization))
@@ -632,6 +691,25 @@ def pharm_login(d: LoginReq):
         raise HTTPException(403,"Your pharmacy registration is pending admin approval.")
     if p.get("approval_status") == "rejected":
         raise HTTPException(403,"Your pharmacy registration was not approved.")
+    tok = _session("pharmacy_sessions","pharmacy_id",p["id"])
+    r = dict(p); r.pop("password_hash",None)
+    return {"success":True,"token":tok,"pharmacy":r}
+
+@app.post("/api/pharmacies/login_by_sysid")
+def pharm_login_sysid(data: dict):
+    name   = (data.get("name") or "").strip().lower()
+    sys_id = (data.get("system_id") or "").strip().upper()
+    if not name or not sys_id: raise HTTPException(400,"Pharmacy name and System ID required")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM pharmacies WHERE system_id=%s",(sys_id,))
+    p = cur.fetchone(); cur.close(); conn.close()
+    if not p: raise HTTPException(404,"System ID not found.")
+    if p["name"].strip().lower() != name:
+        raise HTTPException(401,"Pharmacy name does not match our records for this System ID.")
+    if p.get("approval_status","pending") == "pending":
+        raise HTTPException(403,"Your pharmacy is pending admin approval.")
+    if p.get("approval_status") == "rejected":
+        raise HTTPException(403,"Your registration was not approved.")
     tok = _session("pharmacy_sessions","pharmacy_id",p["id"])
     r = dict(p); r.pop("password_hash",None)
     return {"success":True,"token":tok,"pharmacy":r}
