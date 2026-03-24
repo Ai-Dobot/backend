@@ -1350,17 +1350,73 @@ def update_medicine(med_id: int, d: MedUpdate, authorization: Optional[str] = He
     conn.close()
     return {"success": True, "medicine_id": med_id}
 
+def _countries_from_restcountries() -> list:
+    """Smaller JSON (~200KB) — reliable from Render."""
+    r = requests.get(
+        "https://restcountries.com/v3.1/all?fields=name",
+        timeout=60,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; AI-Dobot-Backend/1.0)"},
+    )
+    r.raise_for_status()
+    data = r.json()
+    names = set()
+    for c in data:
+        n = (c or {}).get("name") or {}
+        common = n.get("common")
+        if common:
+            names.add(common)
+    return sorted(names)
+
+
+def _countries_from_countriesnow() -> list:
+    """Large payload (~1MB) — can time out on some hosts; used as 2nd try."""
+    r = requests.get(
+        "https://countriesnow.space/api/v0.1/countries",
+        timeout=120,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; AI-Dobot-Backend/1.0)"},
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("error"):
+        raise RuntimeError(j.get("msg") or "countriesnow returned error")
+    return sorted({x.get("country") for x in (j.get("data") or []) if x.get("country")})
+
+
+def _countries_static_fallback() -> list:
+    """Always works if outbound APIs fail (same names as typical shop filters)."""
+    raw = (
+        "Afghanistan,Albania,Algeria,Andorra,Angola,Antigua and Barbuda,Argentina,Armenia,Australia,Austria,Azerbaijan,"
+        "Bahamas,Bahrain,Bangladesh,Barbados,Belarus,Belgium,Belize,Benin,Bhutan,Bolivia,Bosnia and Herzegovina,Botswana,Brazil,Brunei,Bulgaria,Burkina Faso,Burundi,"
+        "Cambodia,Cameroon,Canada,Cape Verde,Central African Republic,Chad,Chile,China,Colombia,Comoros,Congo,Costa Rica,Croatia,Cuba,Cyprus,Czechia,"
+        "Democratic Republic of the Congo,Denmark,Djibouti,Dominica,Dominican Republic,Ecuador,Egypt,El Salvador,Equatorial Guinea,Eritrea,Estonia,Eswatini,Ethiopia,"
+        "Fiji,Finland,France,Gabon,Gambia,Georgia,Germany,Ghana,Greece,Grenada,Guatemala,Guinea,Guinea-Bissau,Guyana,Haiti,Honduras,Hungary,"
+        "Iceland,India,Indonesia,Iran,Iraq,Ireland,Israel,Italy,Jamaica,Japan,Jordan,Kazakhstan,Kenya,Kiribati,Kuwait,Kyrgyzstan,"
+        "Laos,Latvia,Lebanon,Lesotho,Liberia,Libya,Liechtenstein,Lithuania,Luxembourg,Madagascar,Malawi,Malaysia,Maldives,Mali,Malta,Marshall Islands,Mauritania,Mauritius,Mexico,Micronesia,Moldova,Monaco,Mongolia,Montenegro,Morocco,Mozambique,Myanmar,"
+        "Namibia,Nauru,Nepal,Netherlands,New Zealand,Nicaragua,Niger,Nigeria,North Korea,North Macedonia,Norway,Oman,Pakistan,Palau,Palestine,Panama,Papua New Guinea,Paraguay,Peru,Philippines,Poland,Portugal,Qatar,Romania,Russia,Rwanda,"
+        "Saint Kitts and Nevis,Saint Lucia,Saint Vincent and the Grenadines,Samoa,San Marino,Sao Tome and Principe,Saudi Arabia,Senegal,Serbia,Seychelles,Sierra Leone,Singapore,Slovakia,Slovenia,Solomon Islands,Somalia,South Africa,South Korea,South Sudan,Spain,Sri Lanka,Sudan,Suriname,Sweden,Switzerland,Syria,"
+        "Taiwan,Tajikistan,Tanzania,Thailand,Timor-Leste,Togo,Tonga,Trinidad and Tobago,Tunisia,Turkey,Turkmenistan,Tuvalu,Uganda,Ukraine,United Arab Emirates,United Kingdom,United States,Uruguay,Uzbekistan,Vanuatu,Vatican City,Venezuela,Vietnam,Yemen,Zambia,Zimbabwe"
+    )
+    return sorted({x.strip() for x in raw.split(",") if x.strip()})
+
+
 @app.get("/api/shop/locations/countries")
 def shop_location_countries():
-    """Proxy country list (avoids browser CORS to third-party APIs)."""
-    try:
-        r = requests.get("https://countriesnow.space/api/v0.1/countries", timeout=25)
-        r.raise_for_status()
-        j = r.json()
-        names = sorted({x.get("country") for x in (j.get("data") or []) if x.get("country")})
-        return {"countries": names}
-    except Exception as e:
-        raise HTTPException(502, f"Could not load countries: {e!s}")
+    """Country list for shop / pharmacy registration (browser calls this; no CORS to third parties)."""
+    sources = (
+        ("restcountries", _countries_from_restcountries),
+        ("countriesnow", _countries_from_countriesnow),
+    )
+    last_err = None
+    for _label, fn in sources:
+        try:
+            names = fn()
+            if names:
+                return {"countries": names, "source": _label}
+        except Exception as e:
+            last_err = e
+            continue
+    static = _countries_static_fallback()
+    return {"countries": static, "source": "static", "warning": str(last_err) if last_err else None}
 
 
 @app.post("/api/shop/locations/states")
