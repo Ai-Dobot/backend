@@ -1,3 +1,7 @@
+# Vital Monitor (local Flask app)
+flask
+
+# Render FastAPI backend (backend.py) — same stack as doctor-app
 fastapi
 uvicorn[standard]
 requests
@@ -6,3 +10,4 @@ google-auth-httplib2
 httplib2
 psycopg2-binary
 python-multipart
+cloudinary
