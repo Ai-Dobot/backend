@@ -23,8 +23,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 import requests, os, json, uuid, time, re
-# Auto-install psycopg2-binary if not present (handles Render build cache issues)
+# Auto-install deps if not present (Render / minimal requirements.txt)
 import subprocess, sys
+try:
+    import multipart  # noqa: F401 — from package python-multipart (FastAPI UploadFile)
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'python-multipart', '-q'])
 try:
     import psycopg2
 except ImportError:
