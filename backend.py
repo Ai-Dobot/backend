@@ -107,6 +107,40 @@ def _personal_name_match(saved_norm: str, doc_name: str) -> bool:
         return False
     return st <= dt
 
+
+def _phone_pair_match(saved_digits: str, doctor_phone: str) -> bool:
+    """Same rule as robot Flask: saved digit sequence must appear in doctor's normalized digits."""
+    sp = _norm_phone(saved_digits or "")
+    dp = _norm_phone(doctor_phone or "")
+    return bool(sp) and bool(dp) and sp in dp
+
+
+def _find_reg_doctor_personal_row(name: str, phone: str):
+    """
+    Registered doctor (approved) whose name + phone match the robot 'password pair'
+    (_personal_name_match on normalized names + phone digits rule).
+    """
+    n = _norm_name(name or "")
+    p = _norm_phone(phone or "")
+    if not n or not p:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT id, system_id, name, specialty, country, city, phone, avatar
+               FROM reg_doctors
+               WHERE approval_status = 'approved'"""
+        )
+        for row in cur.fetchall() or []:
+            if _personal_name_match(n, row.get("name") or "") and _phone_pair_match(p, row.get("phone") or ""):
+                return dict(row)
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
 def _hydrate_online_doctor(doc: dict) -> dict:
     # If live in-memory presence lacks profile metadata, enrich from DB by name.
     if (doc.get("country") and doc.get("phone")) or not doc.get("name"):
@@ -517,12 +551,13 @@ def get_online_doctors(
         online = [d for d in online if (d.get("country") or "").strip().lower() == c]
     if ci:
         online = [d for d in online if (d.get("city") or "").strip().lower() == ci]
-    # Personal mode: both name + phone → strict whole-token name match (not substring)
+    # Personal mode: both name + phone → same rules as robot verify (token name + digit substring)
     if dn and dp:
         online = [
-            d for d in online
+            d
+            for d in online
             if _personal_name_match(dn, d.get("name") or "")
-            and _norm_phone(d.get("phone") or "").endswith(dp)
+            and _phone_pair_match(dp, d.get("phone") or "")
         ]
     else:
         if dn:
@@ -551,7 +586,10 @@ def get_online_doctors(
                 for d in online
                 if (d.get("hospital_registration_no") or "").strip().lower() == hr
             ]
-    if only_private is True:
+    _op = only_private
+    if isinstance(_op, str):
+        _op = _op.strip().lower() in ("1", "true", "yes", "on")
+    if _op is True:
         online = [d for d in online if bool(d.get("is_private", True))]
 
     safe = [{k: v for k, v in d.items() if k != "token"} for d in online]
@@ -627,6 +665,26 @@ def verify_hospital_for_robot(
         conn.close()
 
 
+@app.get("/api/doctors/verify-personal-for-robot")
+def verify_personal_doctor_for_robot(
+    doctor_name: str,
+    doctor_phone: str,
+):
+    """Robot Doctor Settings: name + phone must match one approved registered doctor."""
+    dn = (doctor_name or "").strip()
+    dp = (doctor_phone or "").strip()
+    if not dn or not dp:
+        raise HTTPException(400, "Both doctor name and phone number are required.")
+    row = _find_reg_doctor_personal_row(dn, dp)
+    if not row:
+        raise HTTPException(
+            404,
+            "Doctor name and phone number do not match any approved registered doctor. "
+            "Use the same name and number as in the Doctor Portal.",
+        )
+    return {"ok": True, "doctor": row}
+
+
 @app.post("/api/calls/initiate")
 def initiate_call(call: PatientCall):
     hosp_name = (call.hospital_name or "").strip()
@@ -671,17 +729,19 @@ def initiate_call(call: PatientCall):
     elif call.doctor_name or call.doctor_phone:
         n = _norm_name(call.doctor_name or "")
         p = _norm_phone(call.doctor_phone or "")
+        if n and p:
+            if not _find_reg_doctor_personal_row(call.doctor_name or "", call.doctor_phone or ""):
+                raise HTTPException(
+                    404,
+                    "Doctor name and phone number do not match any registered doctor. "
+                    "Check Robot Doctor Settings — both must match your Doctor Portal profile.",
+                )
         targets = []
         for d in online:
-            name_ok = (not n) or (n in _norm_name(d.get("name") or ""))
-            phone_ok = (not p) or (p in _norm_phone(d.get("phone") or ""))
+            name_ok = (not n) or _personal_name_match(n, d.get("name") or "")
+            phone_ok = (not p) or _phone_pair_match(p, d.get("phone") or "")
             if name_ok and phone_ok:
                 targets.append(doctors[d["doctor_id"]])
-        if not targets and n:
-            # fallback: if phone mismatched, allow name-only match
-            for d in online:
-                if n in _norm_name(d.get("name") or ""):
-                    targets.append(doctors[d["doctor_id"]])
     else:
         targets = [doctors[d["doctor_id"]] for d in online]
 
