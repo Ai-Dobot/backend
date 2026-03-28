@@ -529,10 +529,28 @@ def get_online_doctors(
             online = [d for d in online if dn in _norm_name(d.get("name") or "")]
         if dp:
             online = [d for d in online if dp and dp in _norm_phone(d.get("phone") or "")]
-    if hn:
-        online = [d for d in online if hn in (d.get("hospital_name") or "").strip().lower()]
-    if hr:
-        online = [d for d in online if (d.get("hospital_registration_no") or "").strip().lower() == hr]
+    if hn and hr:
+        hrow = _find_hospital_row(hospital_name, hospital_reg_no)
+        if not hrow:
+            online = []
+        else:
+            hn_exact = (hrow["name"] or "").strip().lower()
+            hr_exact = (hrow.get("registration_no") or "").strip().lower()
+            online = [
+                d
+                for d in online
+                if (d.get("hospital_name") or "").strip().lower() == hn_exact
+                and (d.get("hospital_registration_no") or "").strip().lower() == hr_exact
+            ]
+    else:
+        if hn:
+            online = [d for d in online if hn in (d.get("hospital_name") or "").strip().lower()]
+        if hr:
+            online = [
+                d
+                for d in online
+                if (d.get("hospital_registration_no") or "").strip().lower() == hr
+            ]
     if only_private is True:
         online = [d for d in online if bool(d.get("is_private", True))]
 
@@ -553,8 +571,8 @@ class PatientCall(BaseModel):
 
 def _find_hospital_row(hosp_name: str, hosp_reg: str):
     """
-    Match hospitals row from robot settings. Exact name+reg first, then registration-only,
-    then fuzzy name — avoids 404 when spacing/casing differs from DB.
+    Strict pair match only: hospital name + registration must both match the same DB row
+    (case-insensitive, trimmed). No fuzzy fallback — wrong pair = no route / wrong hospital.
     """
     hn = (hosp_name or "").strip()
     hr = (hosp_reg or "").strip()
@@ -570,35 +588,40 @@ def _find_hospital_row(hosp_name: str, hosp_reg: str):
                LIMIT 1""",
             (hn, hr),
         )
-        row = cur.fetchone()
-        if row:
-            return row
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/hospitals/verify-for-robot")
+def verify_hospital_for_robot(
+    hospital_name: str,
+    hospital_reg_no: str,
+):
+    """Robot Doctor Settings: both fields must match one registered hospital (like username+password)."""
+    hn = (hospital_name or "").strip()
+    hr = (hospital_reg_no or "").strip()
+    if not hn or not hr:
+        raise HTTPException(400, "Both hospital name and registration number are required.")
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
         cur.execute(
-            """SELECT id, name, registration_no FROM hospitals
-               WHERE lower(trim(coalesce(registration_no,''))) = lower(trim(%s))
+            """SELECT id, name, registration_no, system_id FROM hospitals
+               WHERE lower(trim(name)) = lower(trim(%s))
+                 AND lower(trim(coalesce(registration_no,''))) = lower(trim(%s))
                LIMIT 1""",
-            (hr,),
+            (hn, hr),
         )
         row = cur.fetchone()
-        if row:
-            return row
-        cur.execute(
-            """SELECT id, name, registration_no FROM hospitals
-               WHERE lower(trim(name)) LIKE %s
-               LIMIT 8""",
-            (f"%{hn.lower()}%",),
-        )
-        rows = cur.fetchall() or []
-        if len(rows) == 1:
-            return rows[0]
-        hr_l = hr.lower()
-        for r in rows:
-            reg = (r.get("registration_no") or "").strip().lower()
-            if reg == hr_l or hr_l in reg or reg in hr_l:
-                return r
-        if rows:
-            return rows[0]
-        return None
+        if not row:
+            raise HTTPException(
+                404,
+                "Hospital name and registration number do not match any registered hospital. "
+                "Copy them exactly from your Hospital Portal (spacing differences are ignored; spelling must match).",
+            )
+        return {"ok": True, "hospital": dict(row)}
     finally:
         cur.close()
         conn.close()
@@ -613,7 +636,7 @@ def initiate_call(call: PatientCall):
         if not h:
             raise HTTPException(
                 404,
-                "Hospital not found — check name and registration number match the portal, or ask admin to register this hospital.",
+                "Hospital name and registration number do not match together. Check Robot Doctor Settings — both must match your hospital record exactly.",
             )
         call_id = str(uuid.uuid4())[:8]
         video_call_url = f"https://meet.jit.si/ai-dobot-{call_id}"
