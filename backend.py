@@ -551,20 +551,70 @@ class PatientCall(BaseModel):
     hospital_name: Optional[str] = None
     hospital_reg_no: Optional[str] = None
 
+def _find_hospital_row(hosp_name: str, hosp_reg: str):
+    """
+    Match hospitals row from robot settings. Exact name+reg first, then registration-only,
+    then fuzzy name — avoids 404 when spacing/casing differs from DB.
+    """
+    hn = (hosp_name or "").strip()
+    hr = (hosp_reg or "").strip()
+    if not hn or not hr:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT id, name, registration_no FROM hospitals
+               WHERE lower(trim(name)) = lower(trim(%s))
+                 AND lower(trim(coalesce(registration_no,''))) = lower(trim(%s))
+               LIMIT 1""",
+            (hn, hr),
+        )
+        row = cur.fetchone()
+        if row:
+            return row
+        cur.execute(
+            """SELECT id, name, registration_no FROM hospitals
+               WHERE lower(trim(coalesce(registration_no,''))) = lower(trim(%s))
+               LIMIT 1""",
+            (hr,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row
+        cur.execute(
+            """SELECT id, name, registration_no FROM hospitals
+               WHERE lower(trim(name)) LIKE %s
+               LIMIT 8""",
+            (f"%{hn.lower()}%",),
+        )
+        rows = cur.fetchall() or []
+        if len(rows) == 1:
+            return rows[0]
+        hr_l = hr.lower()
+        for r in rows:
+            reg = (r.get("registration_no") or "").strip().lower()
+            if reg == hr_l or hr_l in reg or reg in hr_l:
+                return r
+        if rows:
+            return rows[0]
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
 @app.post("/api/calls/initiate")
 def initiate_call(call: PatientCall):
     hosp_name = (call.hospital_name or "").strip()
     hosp_reg = (call.hospital_reg_no or "").strip()
     if hosp_name and hosp_reg:
-        conn = get_conn(); cur = conn.cursor()
-        cur.execute("""SELECT id, name, registration_no
-                       FROM hospitals
-                       WHERE LOWER(name)=LOWER(%s) AND LOWER(COALESCE(registration_no,''))=LOWER(%s)
-                       LIMIT 1""", (hosp_name, hosp_reg))
-        h = cur.fetchone()
-        cur.close(); conn.close()
+        h = _find_hospital_row(hosp_name, hosp_reg)
         if not h:
-            raise HTTPException(404, "Selected hospital not found")
+            raise HTTPException(
+                404,
+                "Hospital not found — check name and registration number match the portal, or ask admin to register this hospital.",
+            )
         call_id = str(uuid.uuid4())[:8]
         video_call_url = f"https://meet.jit.si/ai-dobot-{call_id}"
         pending_hospital_calls[call_id + "_H" + str(h["id"])] = {
